@@ -7,7 +7,7 @@ import { generateText, tool } from "ai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { z } from "zod";
 import qrcode from "qrcode-terminal";
-import { ensureAiConfig, loadConfig, saveConfig, type WagentConfig } from "./config.js";
+import { ensureAiConfig, loadConfig, saveConfig, getCoreContent, writeCoreContent, appendToCore, getCorePath, type WagentConfig } from "./config.js";
 import type {
   NormalizedMessageEvent,
   NormalizedConnectionEvent,
@@ -656,6 +656,38 @@ function buildTools(adapter: BaileysAdapter) {
       },
     }),
 
+    readCore: tool({
+      description: "Read your current core.md. This is your identity/behavior/rules file — the system prompt used for every message.",
+      inputSchema: z.object({}),
+      execute: async () => {
+        return getCoreContent();
+      },
+    }),
+
+    appendCore: tool({
+      description: "Add a line to core.md (your identity file). Use this when you learn something important about yourself, the user, or how you should behave.",
+      inputSchema: z.object({
+        text: z.string().describe("The line to append to core.md"),
+      }),
+      execute: async ({ text }) => {
+        appendToCore(text);
+        coreContent = getCoreContent();
+        return `Added to core: ${text}`;
+      },
+    }),
+
+    overwriteCore: tool({
+      description: "Replace your entire core.md with new content. Use this to rewrite your identity/rules entirely.",
+      inputSchema: z.object({
+        content: z.string().describe("The new core.md content"),
+      }),
+      execute: async ({ content }) => {
+        writeCoreContent(content);
+        coreContent = content;
+        return "Core rewritten";
+      },
+    }),
+
     archiveChat: tool({
       description: "Archive or unarchive a chat",
       inputSchema: z.object({
@@ -694,35 +726,14 @@ function buildTools(adapter: BaileysAdapter) {
   };
 }
 
-const SYSTEM_PROMPT = `You are a WhatsApp assistant called "wagent". You have full access to all WhatsApp features.
+let coreContent = "";
 
-CAPABILITIES:
-- Send and receive text, images, videos, audio, documents, locations, contacts, polls
-- Create and manage groups (add/remove/promote/demote members, change settings)
-- Search contacts, check if numbers are on WhatsApp
-- Forward, edit, delete, pin messages
-- React to messages with emojis
-- Show typing indicators and mark messages as read
-- Manage profile (name, status)
-- Post status/story updates
-- Archive, pin, mute chats
+function loadCore(): void {
+  coreContent = getCoreContent();
+}
 
-CRITICAL RULES:
-- Your response TEXT is automatically sent back to the conversation. NEVER call sendText/sendImage/etc to reply in the current conversation. Only use send tools to message OTHER people.
-- Send tools accept contact names, phone numbers, or JIDs. If the user says "message Bharghav", call sendText with to="Bharghav"; the app resolves it safely.
-- Use searchContact only when the user asks to look up contacts or when you need to disambiguate before answering.
-
-BEHAVIOR:
-- When the sender is YOU (self-message): treat it as a command. Execute the requested actions.
-- When the sender is someone else: respond helpfully based on context.
-- Unless instructed "silently", summarize what you did in a brief text response.
-- You can chain multiple tool calls in sequence.
-- Keep responses concise. Be direct and practical.`;
-
-function getSystemPrompt(config: WagentConfig): string {
-  const identity = config.agent.systemPrompt ? `\n\nAGENT-WRITTEN IDENTITY:\n${config.agent.systemPrompt}` : "";
-  const memory = config.agent.memorySummary ? `\n\nCOMPACTED MEMORY:\n${config.agent.memorySummary}` : "";
-  return `${SYSTEM_PROMPT}${identity}${memory}`;
+function getSystemPrompt(): string {
+  return coreContent;
 }
 
 function hasMentionBypass(text: string, config: WagentConfig): boolean {
@@ -737,7 +748,6 @@ function isListed(value: string, list: string[]): boolean {
 function messageCanReachAgent(config: WagentConfig, event: NormalizedMessageEvent, isSelf: boolean, text: string): boolean {
   if (hasMentionBypass(text, config)) return true;
   if (isSelf) return true;
-  if (config.agent.mode === "bootstrap") return false;
   if (!config.agent.policy.autoReplyEnabled) return false;
 
   const isGroup = event.chatId.endsWith("@g.us");
@@ -750,19 +760,6 @@ function messageCanReachAgent(config: WagentConfig, event: NormalizedMessageEven
   return false;
 }
 
-function isConfirmation(text: string): boolean {
-  return /\b(confirm|confirmed|approve|approved|yes|ship it|looks good)\b/i.test(text);
-}
-
-function isPromptDraftRequest(text: string): boolean {
-  return /\b(enough|draft|write.*prompt|make.*prompt|system prompt|ready|done|that's it|that is it)\b/i.test(text);
-}
-
-function maybeExtractSayCommand(text: string): string | null {
-  const match = text.match(/^\s*say\s+["']?(.+?)["']?\s*$/i);
-  return match?.[1]?.trim() ?? null;
-}
-
 function withAgentPrefix(text: string): string {
   return text.trim().toLowerCase().startsWith("wagent:") ? text : `wagent: ${text}`;
 }
@@ -771,67 +768,6 @@ async function sendTracked(adapter: BaileysAdapter, config: WagentConfig, to: st
   await delayBeforeReply(config);
   const res = await adapter.sendMessage(to, { type: "text", text: withAgentPrefix(text) });
   rememberAgentMessage(res.messageId);
-}
-
-async function startBootstrap(adapter: BaileysAdapter, config: WagentConfig, myJid: string): Promise<WagentConfig> {
-  if (config.agent.bootstrapStarted || config.agent.mode !== "bootstrap") return config;
-  logger.info("Bootstrap started");
-  await sendTracked(adapter, config, myJid, "I'm online. I don't know who I am yet.");
-  await delayBeforeReply(config);
-  await sendTracked(adapter, config, myJid, "I need to know my purpose, what to call you, my vibe, and who I can read/reply to. Say 'draft prompt' when you're ready to lock it in.");
-  config.agent.bootstrapStarted = true;
-  saveConfig(config);
-  return config;
-}
-
-async function handleBootstrapCommand(
-  adapter: BaileysAdapter,
-  config: WagentConfig,
-  chatId: string,
-  text: string,
-): Promise<{ handled: true; config: WagentConfig } | { handled: false }> {
-  if (config.agent.pendingSystemPrompt && isConfirmation(text)) {
-    config.agent.systemPrompt = config.agent.pendingSystemPrompt;
-    config.agent.pendingSystemPrompt = undefined;
-    config.agent.memorySummary = config.agent.bootstrapNotes.join("\n").slice(-6000);
-    config.agent.mode = "configured";
-    saveConfig(config);
-    logger.info("Bootstrap done — system prompt locked");
-    await sendTracked(adapter, config, chatId, "Confirmed. Locked in my system prompt.");
-    return { handled: true, config };
-  }
-
-  if (config.agent.pendingSystemPrompt && !isConfirmation(text)) {
-    config.agent.bootstrapNotes.push(`Feedback: ${text}`);
-    config.agent.pendingSystemPrompt = undefined;
-    saveConfig(config);
-    await sendTracked(adapter, config, chatId, "Draft discarded. Say 'draft prompt' for a new one.");
-    return { handled: true, config };
-  }
-
-  const say = maybeExtractSayCommand(text);
-  if (say) {
-    await sendTracked(adapter, config, chatId, say);
-    return { handled: true, config };
-  }
-
-  if (isPromptDraftRequest(text)) {
-    logger.info("Drafting system prompt...");
-    const draft = await generateWithFallback(config, {
-      system: "Draft a concise first-person system prompt for a WhatsApp agent from the user's setup notes. Include identity, purpose, vibe, read/reply boundaries, and tool behavior. Return only the prompt.",
-      messages: [{ role: "user", content: config.agent.bootstrapNotes.join("\n\n") }],
-      temperature: 0.3,
-    });
-    config.agent.pendingSystemPrompt = draft.text.trim();
-    saveConfig(config);
-    await sendTracked(adapter, config, chatId,
-      `System prompt draft:\n\n${config.agent.pendingSystemPrompt}\n\nReply "confirm" if correct, or tell me what to change.`);
-    return { handled: true, config };
-  }
-
-  config.agent.bootstrapNotes.push(text);
-  saveConfig(config);
-  return { handled: false };
 }
 
 async function processMessage(
@@ -863,7 +799,7 @@ async function processMessage(
     logger.info("Processing message...");
 
     const result = await generateWithFallback(config, {
-      system: getSystemPrompt(config),
+      system: getSystemPrompt(),
       messages,
       tools,
       temperature: 0.7,
@@ -907,15 +843,15 @@ async function processMessage(
 async function main() {
   const args = process.argv.slice(2);
   if (args.includes("--help") || args.includes("-h")) {
-    console.log(`wagent\n\nUsage:\n  wagent              Start agent (pairs WhatsApp first if needed)\n  wagent start        Start agent\n  wagent setup        Re-run AI provider setup after WhatsApp pairing\n  wagent config       Show config path and provider\n  wagent --verbose    Show lifecycle logs\n  wagent --debug      Show debug logs\n`);
+    console.log(`wagent\n\nUsage:\n  wagent              Start agent\n  wagent start        Start agent\n  wagent setup        Re-run AI provider setup\n  wagent config       Show config\n  wagent --verbose    Show lifecycle logs\n  wagent --debug      Show debug logs\n`);
     return;
   }
 
   let config = loadConfig();
 
   if (args[0] === "config") {
-    const { getConfigPath } = await import("./config.js");
-    console.log(JSON.stringify({ path: getConfigPath(), provider: config.provider, model: config.model, configured: Boolean(config.apiKey), agentMode: config.agent.mode }, null, 2));
+    const { getConfigPath, getCorePath, getCoreContent } = await import("./config.js");
+    console.log(JSON.stringify({ config: getConfigPath(), core: getCorePath(), provider: config.provider, model: config.model, configured: Boolean(config.apiKey) }, null, 2));
     return;
   }
 
@@ -975,10 +911,11 @@ async function main() {
 
   config = await ensureAiConfig(config);
 
-  logger.info(`Provider: ${config.provider}, Model: ${config.model}, Mode: ${config.agent.mode}`);
+  loadCore();
+  logger.info(`Provider: ${config.provider}, Model: ${config.model}`);
+  logger.info(`Core: ${getCorePath()}`);
 
   const tools = buildTools(adapter);
-  config = await startBootstrap(adapter, config, myUserJid ?? myJid);
 
   logger.info("Agent ready");
 
@@ -1014,11 +951,6 @@ async function main() {
       }
 
       await waitForTypingToStop(msg.chatId);
-
-      if (config.agent.mode === "bootstrap" && isOwnerSelfChat) {
-        const result = await handleBootstrapCommand(adapter, config, msg.chatId, text);
-        if (result.handled) { config = result.config; return; }
-      }
 
       const senderName = await getContactName(adapter, msg.message.sender);
       const chatName =

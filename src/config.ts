@@ -20,12 +20,7 @@ export interface AgentPolicy {
 }
 
 export interface AgentState {
-  mode: "bootstrap" | "configured";
-  bootstrapStarted: boolean;
-  pendingSystemPrompt?: string;
-  systemPrompt?: string;
-  memorySummary?: string;
-  bootstrapNotes: string[];
+  mode: "configured";
   policy: AgentPolicy;
 }
 
@@ -56,6 +51,20 @@ export function getConfigPath(): string {
   return join(ensureConfigDir(), "config.json");
 }
 
+export function getCorePath(): string {
+  return join(getConfigDir(), "core.md");
+}
+
+export const DEFAULT_CORE = `You are a friendly AI assistant with full WhatsApp tools.
+
+Core behavior:
+- Be helpful, friendly, and conversational
+- You can add people to whitelist or blacklist to control access
+- If @wagent is mentioned in a group, you are allowed to reply there
+- Keep responses concise and practical
+
+You can update this file with important learnings using the append/overwrite core tools.`;
+
 export function defaultPolicy(): AgentPolicy {
   return {
     autoReplyEnabled: false,
@@ -72,9 +81,7 @@ export function defaultPolicy(): AgentPolicy {
 
 export function defaultAgentState(): AgentState {
   return {
-    mode: "bootstrap",
-    bootstrapStarted: false,
-    bootstrapNotes: [],
+    mode: "configured",
     policy: defaultPolicy(),
   };
 }
@@ -101,7 +108,6 @@ export function loadConfig(): WagentConfig {
       ...defaultAgentState(),
       ...(fromDisk.agent ?? {}),
       policy: { ...defaultPolicy(), ...(fromDisk.agent?.policy ?? {}) },
-      bootstrapNotes: fromDisk.agent?.bootstrapNotes ?? [],
     },
   };
 
@@ -114,6 +120,23 @@ export function loadConfig(): WagentConfig {
   }
 
   return merged;
+}
+
+export function getCoreContent(): string {
+  const path = getCorePath();
+  if (existsSync(path)) return readFileSync(path, "utf8");
+  writeFileSync(path, `${DEFAULT_CORE}\n`);
+  return DEFAULT_CORE;
+}
+
+export function writeCoreContent(content: string): void {
+  writeFileSync(getCorePath(), `${content}\n`);
+}
+
+export function appendToCore(text: string): void {
+  const current = getCoreContent();
+  const updated = current.endsWith("\n") ? `${current}${text}\n` : `${current}\n${text}\n`;
+  writeFileSync(getCorePath(), updated);
 }
 
 export function saveConfig(config: WagentConfig): void {

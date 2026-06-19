@@ -5,7 +5,11 @@
 import pino from "pino";
 import { SERVER_NAME, DEFAULT_LOG_LEVEL } from "../constants.js";
 
-const logLevel = process.env.WA_LOG_LEVEL ?? DEFAULT_LOG_LEVEL;
+const logLevel = process.argv.includes("--debug")
+  ? "debug"
+  : process.argv.includes("--verbose")
+    ? "info"
+    : DEFAULT_LOG_LEVEL;
 const isStdio = process.env.WA_TRANSPORT === "stdio";
 
 export const logger = pino(

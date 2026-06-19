@@ -1,85 +1,102 @@
-# wagent — WhatsApp AI Agent
+# wagent
 
-A programmable WhatsApp agent powered by Groq LLM, Vercel AI SDK, and Baileys (WhatsApp Web). Send commands via self-messages — your own number becomes the control channel.
+Programmable WhatsApp AI agent that runs from your terminal.
 
-## Features
+It pairs with WhatsApp first, then asks for an AI provider/API key, then bootstraps itself by messaging you for identity, purpose, vibe, and permissions.
 
-- **Self-programmable** — message yourself to command the agent
-- **Full WhatsApp API** — send/receive text, images, videos, audio, documents, locations, contacts, polls
-- **Group management** — create, join, leave, manage groups (add/remove/promote/demote members)
-- **Chat management** — archive, pin, mute, mark read, send presence indicators
-- **Profile management** — update name, status, get profile info
-- **Status/stories** — post text and image status updates
-- **Message management** — forward, edit, delete, pin, react to messages
-- **Contact management** — search contacts, check numbers on WhatsApp, block/unblock
-- **Conversation memory** — remembers recent chat history per conversation
-- **Auto-reply** — responds to incoming messages from others
-
-## Prerequisites
-
-- **Node.js >= 22** (tested on v24)
-- **pnpm** (package manager)
-- **Groq API key** — get one at [console.groq.com](https://console.groq.com)
-
-## Setup
+## Install / Run
 
 ```bash
-# Clone
-git clone <your-repo-url>
-cd wagent
-
-# Install dependencies
-pnpm install
-
-# Set up environment
-cp .env.example .env
-# Edit .env and add your GROQ_API_KEY
+npx wagent
 ```
 
-## Usage
+Or install globally:
 
 ```bash
+npm i -g wagent
+wagent
+```
+
+From source:
+
+```bash
+pnpm install
+pnpm build
 pnpm wagent
 ```
 
-First run will display a QR code — scan it with WhatsApp (Linked Devices) to authenticate. The session is persisted to SQLite, so you won't need to re-scan on restart.
+## First Run Flow
 
-### How to use
+1. Pair WhatsApp by scanning the QR code.
+2. Choose an AI provider.
+3. Enter API key.
+4. The agent messages you to configure its identity and permissions.
+5. It drafts a system prompt and asks for confirmation.
+6. After confirmation, it compacts setup context and follows the saved prompt.
 
-Once connected:
-- **Message yourself** to send commands to the agent (e.g., "send hi to mom", "create a group called family with ...")
-- **Others can message you** and the agent will auto-reply
+## Providers
 
-## Configuration
+Setup wizard options:
 
-| Env Variable | Default | Description |
-|---|---|---|
-| `GROQ_API_KEY` | — | Required. Your Groq API key |
-| `GROQ_BASE_URL` | `https://api.groq.com/openai/v1` | Optional. API base URL override |
-| `WA_LOG_LEVEL` | `info` | Log level (debug, info, warn, error) |
+1. Gemini + Web Search (recommended)
+2. Groq
+3. Other OpenAI-compatible endpoint
 
-## Tech Stack
+Config is stored locally, not in `.env`:
 
-- **Runtime:** Node.js + tsx (TypeScript execution)
-- **WhatsApp:** Baileys v7 (WebSocket-based, no browser needed)
-- **AI:** Vercel AI SDK + Groq (llama-3.3-70b-versatile)
-- **Database:** SQLite (via better-sqlite3 + Drizzle ORM)
-- **Schema:** Zod
-- **Logging:** Pino
+- Linux/macOS: `~/.config/wagent/config.json`
+- Windows: `%APPDATA%/wagent/config.json`
 
-## Project Structure
+The WhatsApp SQLite session is stored in the same config directory as `wagent.db`.
 
+Environment variables still work for advanced use:
+
+```bash
+GROQ_API_KEY=...
+GROQ_BASE_URL=https://api.groq.com/openai/v1
+GROQ_MODEL=openai/gpt-oss-120b
 ```
-src/
-├── index.ts                     # Agent entry point
-├── channels/
-│   └── baileys/                 # WhatsApp adapter (Baileys)
-├── db/                          # SQLite schema + migrations
-├── services/
-│   └── instance-manager.ts      # Instance lifecycle management
-├── types/                       # TypeScript types
-└── utils/                       # Logger, constants
+
+## Commands
+
+```bash
+wagent              # start agent
+wagent start        # start agent
+wagent setup        # re-run provider/API-key setup after WhatsApp pairing
+wagent config       # show config path/provider/model
+wagent --verbose    # lifecycle logs
+wagent --debug      # debug logs
 ```
+
+## Message Permissions
+
+By default:
+
+- The agent only reads/responds to you.
+- It does not auto-reply to others.
+- Group chats are ignored unless someone tags `@wagent`.
+- `@wagent` bypasses filters, including blacklist.
+
+The bootstrap conversation lets you configure who it can read, reply to, or message.
+
+## Anti-Ban / Human-Like Behavior
+
+- Replies are delayed randomly between 2 and 8 seconds.
+- The agent waits if the chat is currently typing/recording when WhatsApp presence is available.
+- CLI logs are quiet by default.
+
+## Capabilities
+
+- Send text, image, video, audio, documents, contacts, polls, location
+- Search/resolve contacts by name, phone, or JID
+- Manage profile/status
+- Manage groups/chats
+- Remember and compact context
+- Enforce read/reply/send policy before model access
+
+## Notes
+
+This should run on an always-on machine/VPS. It is not suitable for Vercel serverless because Baileys needs a persistent WhatsApp WebSocket and durable session storage.
 
 ## License
 

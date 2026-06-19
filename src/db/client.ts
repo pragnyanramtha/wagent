@@ -3,12 +3,20 @@
 // ============================================================
 
 import { existsSync, mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 import Database, { type Database as DatabaseType } from "better-sqlite3";
 import { drizzle } from "drizzle-orm/better-sqlite3";
 import * as schema from "./schema.js";
 
-const DB_PATH = "data/whatsapp.db";
+function getDataDir(): string {
+  if (process.env.WAGENT_HOME) return process.env.WAGENT_HOME;
+  if (process.env.WAGENT_DATA_DIR) return process.env.WAGENT_DATA_DIR;
+  if (process.platform === "win32") return join(process.env.APPDATA ?? homedir(), "wagent");
+  return join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "wagent");
+}
+
+const DB_PATH = join(getDataDir(), "wagent.db");
 
 // Ensure the data directory exists
 const dir = dirname(DB_PATH);

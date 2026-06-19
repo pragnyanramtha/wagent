@@ -13,7 +13,7 @@ export const DEFAULT_PORT = 3000;
 export const DEFAULT_REDIS_URL = "redis://localhost:6379";
 
 // Logging
-export const DEFAULT_LOG_LEVEL = "info";
+export const DEFAULT_LOG_LEVEL = "warn";
 
 // Rate Limits (messages per minute)
 export const DEFAULT_BAILEYS_RATE_LIMIT = 20;

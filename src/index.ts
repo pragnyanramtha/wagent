@@ -1,4 +1,4 @@
-import "dotenv/config";
+#!/usr/bin/env node
 import { InstanceManager } from "./services/instance-manager.js";
 import { BaileysAdapter } from "./channels/baileys/baileys.adapter.js";
 import { createChildLogger } from "./utils/logger.js";
@@ -6,24 +6,20 @@ import { generateText, tool } from "ai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { z } from "zod";
 import qrcode from "qrcode-terminal";
+import { ensureAiConfig, loadConfig, saveConfig, type WagentConfig } from "./config.js";
 import type {
   NormalizedMessageEvent,
   NormalizedConnectionEvent,
+  NormalizedPresenceEvent,
   MessageContent,
 } from "./types/channel.types.js";
 const logger = createChildLogger({ service: "wagent" });
-
-const groq = createOpenAICompatible({
-  name: "groq",
-  baseURL: process.env.GROQ_BASE_URL ?? "https://api.groq.com/openai/v1",
-  apiKey: process.env.GROQ_API_KEY ?? "",
-});
-const chatModel = groq.chatModel(process.env.GROQ_MODEL ?? "openai/gpt-oss-120b");
 
 const chatHistories = new Map<string, Array<{ role: "user" | "assistant"; content: string }>>();
 const MAX_HISTORY = 30;
 const processedMessages = new Set<string>();
 const agentSentMessages = new Set<string>();
+const typingUntil = new Map<string, number>();
 
 function getOwnJid(adapter: BaileysAdapter): string | null {
   return adapter.getMyJid();
@@ -40,7 +36,55 @@ function getGroupName(adapter: BaileysAdapter, jid: string): Promise<string> {
   return adapter.getGroupMetadata(jid).then((g) => g.subject).catch(() => jid.split("@")[0]);
 }
 
-type ChatCtx = { currentChatId: string };
+type ChatCtx = { currentChatId: string; config: WagentConfig };
+
+function getModelNames(config: WagentConfig): string[] {
+  return [config.model, ...config.fallbackModels].filter(Boolean);
+}
+
+async function getLanguageModel(config: WagentConfig, modelName: string): Promise<any> {
+  if (config.provider === "gemini") {
+    const mod = await import("@ai-sdk/google");
+    const createGoogleGenerativeAI = (mod as any).createGoogleGenerativeAI;
+    const google = createGoogleGenerativeAI({ apiKey: config.apiKey });
+    return google(modelName);
+  }
+
+  const provider = createOpenAICompatible({
+    name: config.provider,
+    baseURL: config.baseUrl ?? "https://api.groq.com/openai/v1",
+    apiKey: config.apiKey,
+  });
+  return provider.chatModel(modelName);
+}
+
+async function generateWithFallback(config: WagentConfig, options: Record<string, unknown>) {
+  let lastError: unknown;
+  for (const modelName of getModelNames(config)) {
+    try {
+      return await generateText({ ...(options as any), model: await getLanguageModel(config, modelName) });
+    } catch (err) {
+      lastError = err;
+      logger.warn({ err, model: modelName }, "Model failed, trying fallback");
+    }
+  }
+  throw lastError;
+}
+
+function randomBetween(min: number, max: number): number {
+  return Math.floor(min + Math.random() * (max - min + 1));
+}
+
+async function delayBeforeReply(config: WagentConfig): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, randomBetween(config.replyDelayMinMs, config.replyDelayMaxMs)));
+}
+
+async function waitForTypingToStop(chatId: string): Promise<void> {
+  const started = Date.now();
+  while ((typingUntil.get(chatId) ?? 0) > Date.now() && Date.now() - started < 30_000) {
+    await new Promise((resolve) => setTimeout(resolve, 750));
+  }
+}
 
 function rememberAgentMessage(messageId: string): void {
   if (!messageId) return;
@@ -131,6 +175,7 @@ function buildTools(adapter: BaileysAdapter) {
         const target = await resolveTarget(adapter, to, ctx);
         const content: MessageContent = { type: "text", text };
         if (quotedMessageId) content.quotedMessageId = quotedMessageId;
+        await delayBeforeReply(ctx.config);
         const res = await adapter.sendMessage(target, content);
         rememberAgentMessage(res.messageId);
         return `Sent to ${target}. ID: ${res.messageId}`;
@@ -147,6 +192,7 @@ function buildTools(adapter: BaileysAdapter) {
       execute: async ({ to, imageUrl, caption }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
         const target = await resolveTarget(adapter, to, ctx);
+        await delayBeforeReply(ctx.config);
         const res = await adapter.sendMessage(target, { type: "image", image: imageUrl, caption });
         rememberAgentMessage(res.messageId);
         return `Image sent. ID: ${res.messageId}`;
@@ -163,6 +209,7 @@ function buildTools(adapter: BaileysAdapter) {
       execute: async ({ to, videoUrl, caption }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
         const target = await resolveTarget(adapter, to, ctx);
+        await delayBeforeReply(ctx.config);
         const res = await adapter.sendMessage(target, { type: "video", video: videoUrl, caption });
         rememberAgentMessage(res.messageId);
         return `Video sent. ID: ${res.messageId}`;
@@ -179,6 +226,7 @@ function buildTools(adapter: BaileysAdapter) {
       execute: async ({ to, audioUrl, asVoiceNote }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
         const target = await resolveTarget(adapter, to, ctx);
+        await delayBeforeReply(ctx.config);
         const res = await adapter.sendMessage(target, { type: "audio", audio: audioUrl, ptt: asVoiceNote });
         rememberAgentMessage(res.messageId);
         return `Audio sent. ID: ${res.messageId}`;
@@ -196,6 +244,7 @@ function buildTools(adapter: BaileysAdapter) {
       execute: async ({ to, documentUrl, fileName, mimeType }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
         const target = await resolveTarget(adapter, to, ctx);
+        await delayBeforeReply(ctx.config);
         const res = await adapter.sendMessage(target, { type: "document", document: documentUrl, fileName, mimeType });
         rememberAgentMessage(res.messageId);
         return `Document sent. ID: ${res.messageId}`;
@@ -214,6 +263,7 @@ function buildTools(adapter: BaileysAdapter) {
       execute: async ({ to, latitude, longitude, name, address }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
         const target = await resolveTarget(adapter, to, ctx);
+        await delayBeforeReply(ctx.config);
         const res = await adapter.sendMessage(target, { type: "location", latitude, longitude, name, address });
         rememberAgentMessage(res.messageId);
         return `Location sent. ID: ${res.messageId}`;
@@ -230,6 +280,7 @@ function buildTools(adapter: BaileysAdapter) {
       execute: async ({ to, contactName, contactPhone }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
         const target = await resolveTarget(adapter, to, ctx);
+        await delayBeforeReply(ctx.config);
         const res = await adapter.sendMessage(target, { type: "contact", contactName, contactPhone });
         rememberAgentMessage(res.messageId);
         return `Contact sent. ID: ${res.messageId}`;
@@ -247,6 +298,7 @@ function buildTools(adapter: BaileysAdapter) {
       execute: async ({ to, question, options, multiSelect }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
         const target = await resolveTarget(adapter, to, ctx);
+        await delayBeforeReply(ctx.config);
         const res = await adapter.sendMessage(target, { type: "poll", question, options, multiSelect });
         rememberAgentMessage(res.messageId);
         return `Poll sent. ID: ${res.messageId}`;
@@ -656,8 +708,91 @@ BEHAVIOR:
 - You can chain multiple tool calls in sequence.
 - Keep responses concise. Be direct and practical.`;
 
+function getSystemPrompt(config: WagentConfig): string {
+  const identity = config.agent.systemPrompt ? `\n\nAGENT-WRITTEN IDENTITY:\n${config.agent.systemPrompt}` : "";
+  const memory = config.agent.memorySummary ? `\n\nCOMPACTED MEMORY:\n${config.agent.memorySummary}` : "";
+  return `${SYSTEM_PROMPT}${identity}${memory}`;
+}
+
+function hasMentionBypass(text: string, config: WagentConfig): boolean {
+  return text.toLowerCase().includes(config.agent.policy.mentionBypass.toLowerCase());
+}
+
+function isListed(value: string, list: string[]): boolean {
+  const lower = value.toLowerCase();
+  return list.some((item) => lower.includes(item.toLowerCase()) || item.toLowerCase() === lower);
+}
+
+function messageCanReachAgent(config: WagentConfig, event: NormalizedMessageEvent, isSelf: boolean, text: string): boolean {
+  if (hasMentionBypass(text, config)) return true;
+  if (isSelf) return true;
+  if (config.agent.mode === "bootstrap") return false;
+  if (!config.agent.policy.autoReplyEnabled) return false;
+
+  const isGroup = event.chatId.endsWith("@g.us");
+  if (isGroup && !config.agent.policy.allowGroups && !config.agent.policy.whitelistedGroups.includes(event.chatId)) return false;
+
+  const sender = event.message.sender;
+  if (isListed(sender, config.agent.policy.blacklistedContacts)) return false;
+  if (config.agent.policy.readPolicy === "everyone_except_blacklist") return true;
+  if (config.agent.policy.readPolicy === "whitelist") return isListed(sender, config.agent.policy.whitelistedContacts);
+  return false;
+}
+
+function isConfirmation(text: string): boolean {
+  return /\b(confirm|confirmed|approve|approved|yes|ship it|looks good)\b/i.test(text);
+}
+
+async function sendTracked(adapter: BaileysAdapter, to: string, text: string): Promise<void> {
+  const res = await adapter.sendMessage(to, { type: "text", text });
+  rememberAgentMessage(res.messageId);
+}
+
+async function startBootstrap(adapter: BaileysAdapter, config: WagentConfig, myJid: string): Promise<WagentConfig> {
+  if (config.agent.bootstrapStarted || config.agent.mode !== "bootstrap") return config;
+  await sendTracked(adapter, myJid, "I'm online. I don't know who I am yet.");
+  await sendTracked(adapter, myJid, "Tell me my purpose, your relationship to me, my vibe, and who I can read or reply to.");
+  await sendTracked(
+    adapter,
+    myJid,
+    "I can message contacts, manage WhatsApp tools, remember context, compact memory, and enforce read/reply permissions.",
+  );
+  config.agent.bootstrapStarted = true;
+  saveConfig(config);
+  return config;
+}
+
+async function handleBootstrapMessage(
+  adapter: BaileysAdapter,
+  config: WagentConfig,
+  chatId: string,
+  text: string,
+): Promise<WagentConfig> {
+  if (config.agent.pendingSystemPrompt && isConfirmation(text)) {
+    config.agent.systemPrompt = config.agent.pendingSystemPrompt;
+    config.agent.pendingSystemPrompt = undefined;
+    config.agent.memorySummary = config.agent.bootstrapNotes.join("\n").slice(-6000);
+    config.agent.mode = "configured";
+    saveConfig(config);
+    await sendTracked(adapter, chatId, "Confirmed. I compacted setup context and will follow this system prompt from now on.");
+    return config;
+  }
+
+  config.agent.bootstrapNotes.push(text);
+  const draft = await generateWithFallback(config, {
+    system: "Draft a concise first-person system prompt for a WhatsApp agent from the user's setup notes. Include identity, purpose, vibe, read/reply boundaries, and tool behavior. Return only the prompt.",
+    messages: [{ role: "user", content: config.agent.bootstrapNotes.join("\n\n") }],
+    temperature: 0.3,
+  });
+  config.agent.pendingSystemPrompt = draft.text.trim();
+  saveConfig(config);
+  await sendTracked(adapter, chatId, `Here's my proposed system prompt:\n\n${config.agent.pendingSystemPrompt}\n\nReply confirm if this is right, or tell me what to change.`);
+  return config;
+}
+
 async function processMessage(
   adapter: BaileysAdapter,
+  config: WagentConfig,
   instId: string,
   event: NormalizedMessageEvent,
   text: string,
@@ -683,13 +818,12 @@ async function processMessage(
   try {
     logger.info({ chatId, isSelf, text: text.substring(0, 80) }, "Processing with AI");
 
-    const result = await generateText({
-      model: chatModel,
-      system: SYSTEM_PROMPT,
+    const result = await generateWithFallback(config, {
+      system: getSystemPrompt(config),
       messages,
       tools,
       temperature: 0.7,
-      experimental_context: { currentChatId: chatId },
+      experimental_context: { currentChatId: chatId, config },
     });
 
     const responseText = result.text?.trim();
@@ -703,7 +837,7 @@ async function processMessage(
 
     if (responseText) {
       await adapter.sendPresence(chatId, "composing");
-      await new Promise((r) => setTimeout(r, 300));
+      await delayBeforeReply(config);
       const content: MessageContent = { type: "text", text: responseText };
       const res = await adapter.sendMessage(chatId, content);
       rememberAgentMessage(res.messageId);
@@ -726,14 +860,26 @@ async function processMessage(
 }
 
 async function main() {
-  const apiKey = process.env.GROQ_API_KEY;
-  if (!apiKey) {
-    console.error("ERROR: GROQ_API_KEY environment variable is required");
-    console.error("Get one at https://console.groq.com");
-    process.exit(1);
+  const args = process.argv.slice(2);
+  if (args.includes("--help") || args.includes("-h")) {
+    console.log(`wagent\n\nUsage:\n  wagent              Start agent (pairs WhatsApp first if needed)\n  wagent start        Start agent\n  wagent setup        Re-run AI provider setup after WhatsApp pairing\n  wagent config       Show config path and provider\n  wagent --verbose    Show lifecycle logs\n  wagent --debug      Show debug logs\n`);
+    return;
   }
 
-  console.log("wagent — WhatsApp AI Agent starting...\n");
+  let config = loadConfig();
+
+  if (args[0] === "config") {
+    const { getConfigPath } = await import("./config.js");
+    console.log(JSON.stringify({ path: getConfigPath(), provider: config.provider, model: config.model, configured: Boolean(config.apiKey), agentMode: config.agent.mode }, null, 2));
+    return;
+  }
+
+  if (args[0] === "setup") {
+    config.apiKey = "";
+    saveConfig(config);
+  }
+
+  console.log("wagent starting...");
 
   const instanceManager = new InstanceManager();
 
@@ -743,10 +889,8 @@ async function main() {
   if (instances.length === 0) {
     const inst = await instanceManager.createInstance("wagent", "baileys");
     instanceId = inst.id;
-    console.log(`Created new instance: ${instanceId}`);
   } else {
     instanceId = instances[0].id;
-    console.log(`Using existing instance: ${instanceId}`);
   }
 
   let myJid: string | null = null;
@@ -755,14 +899,13 @@ async function main() {
     if (event === "connection.changed" && instId === instanceId) {
       const conn = payload as NormalizedConnectionEvent;
       if (conn.qrCode) {
-        console.log("\nScan QR code to log in:");
+        console.log("\nScan this QR in WhatsApp > Linked Devices:");
         qrcode.generate(conn.qrCode, { small: true });
       }
       if (conn.status === "open") {
         const adapter = instanceManager.getAdapter(instId) as BaileysAdapter;
         myJid = getOwnJid(adapter);
-        console.log(`\nConnected as: ${myJid}`);
-        console.log("Ready. Message yourself to command the agent.\n");
+        console.log(`\nWhatsApp connected as ${myJid}`);
       }
     }
   });
@@ -778,16 +921,27 @@ async function main() {
   }
 
   if (!myJid) {
-    console.error("Failed to connect. Check QR and try again.");
+    console.error("WhatsApp did not connect. Check QR/session and try again.");
     process.exit(1);
   }
 
-  const tools = buildTools(adapter);
+  config = await ensureAiConfig(config);
 
-  console.log(`Logged in: ${myJid}`);
-  console.log("Waiting for messages...\n");
+  const tools = buildTools(adapter);
+  config = await startBootstrap(adapter, config, myJid);
+
+  console.log("Agent ready. Message yourself to configure or command it.");
 
   instanceManager.onAnyEvent(async (event, instId, payload) => {
+    if (event === "presence.updated" && instId === instanceId) {
+      const presence = payload as NormalizedPresenceEvent;
+      if (presence.status === "composing" || presence.status === "recording") {
+        typingUntil.set(presence.chatId, Date.now() + 30_000);
+      } else if (presence.status === "paused" || presence.status === "unavailable") {
+        typingUntil.delete(presence.chatId);
+      }
+    }
+
     if (event === "message.received" && instId === instanceId) {
       const msg = payload as NormalizedMessageEvent;
       const text = msg.message.content;
@@ -804,10 +958,13 @@ async function main() {
       }
 
       const isSelf = msg.message.sender === myJid || msg.message.isFromMe;
-      if (isSelf) {
-        console.log(`Self-command: ${text.substring(0, 100)}`);
-      } else {
-        console.log(`From ${msg.message.sender}: ${text.substring(0, 100)}`);
+      if (!messageCanReachAgent(config, msg, isSelf, text)) return;
+
+      await waitForTypingToStop(msg.chatId);
+
+      if (config.agent.mode === "bootstrap" && isSelf) {
+        config = await handleBootstrapMessage(adapter, config, msg.chatId, text);
+        return;
       }
 
       const senderName = await getContactName(adapter, msg.message.sender);
@@ -816,12 +973,10 @@ async function main() {
           ? await getGroupName(adapter, msg.chatId)
           : senderName;
 
-      processMessage(adapter, instanceId, msg, text, isSelf, senderName, chatName, tools)
+      processMessage(adapter, config, instanceId, msg, text, isSelf, senderName, chatName, tools)
         .catch((err) => logger.error({ err }, "processMessage error"));
     }
   });
-
-  console.log("Agent listening.\n");
 }
 
 main().catch((err) => {

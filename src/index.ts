@@ -2,7 +2,7 @@ import "dotenv/config";
 import { InstanceManager } from "./services/instance-manager.js";
 import { BaileysAdapter } from "./channels/baileys/baileys.adapter.js";
 import { createChildLogger } from "./utils/logger.js";
-import { generateText, tool, stepCountIs } from "ai";
+import { generateText, tool } from "ai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { z } from "zod";
 import qrcode from "qrcode-terminal";
@@ -18,11 +18,12 @@ const groq = createOpenAICompatible({
   baseURL: process.env.GROQ_BASE_URL ?? "https://api.groq.com/openai/v1",
   apiKey: process.env.GROQ_API_KEY ?? "",
 });
-const chatModel = groq.chatModel(process.env.GROQ_MODEL ?? "gpt-oss-120b");
+const chatModel = groq.chatModel(process.env.GROQ_MODEL ?? "openai/gpt-oss-120b");
 
 const chatHistories = new Map<string, Array<{ role: "user" | "assistant"; content: string }>>();
 const MAX_HISTORY = 30;
 const processedMessages = new Set<string>();
+const agentSentMessages = new Set<string>();
 
 function getOwnJid(adapter: BaileysAdapter): string | null {
   return adapter.getMyJid();
@@ -41,6 +42,81 @@ function getGroupName(adapter: BaileysAdapter, jid: string): Promise<string> {
 
 type ChatCtx = { currentChatId: string };
 
+function rememberAgentMessage(messageId: string): void {
+  if (!messageId) return;
+  agentSentMessages.add(messageId);
+  if (agentSentMessages.size > 1000) {
+    const toDelete = [...agentSentMessages].slice(0, 500);
+    for (const id of toDelete) agentSentMessages.delete(id);
+  }
+}
+
+function normalizePhone(input: string): string | null {
+  const digits = input.replace(/[^0-9]/g, "");
+  return digits.length >= 8 ? `${digits}@s.whatsapp.net` : null;
+}
+
+function normalizeName(input: string): string {
+  return input.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function editDistance(a: string, b: string): number {
+  const dp = Array.from({ length: a.length + 1 }, (_, i) =>
+    Array.from({ length: b.length + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0)),
+  );
+  for (let i = 1; i <= a.length; i++) {
+    for (let j = 1; j <= b.length; j++) {
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,
+        dp[i][j - 1] + 1,
+        dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+  }
+  return dp[a.length][b.length];
+}
+
+async function resolveTarget(adapter: BaileysAdapter, to: string | undefined, ctx: ChatCtx): Promise<string> {
+  const raw = to?.trim();
+  if (!raw) return ctx.currentChatId;
+  if (raw.includes("@")) {
+    if (raw.startsWith("@")) throw new Error(`Invalid target JID: ${raw}`);
+    return raw;
+  }
+
+  const phoneJid = normalizePhone(raw);
+  if (phoneJid) return phoneJid;
+
+  let contacts = await adapter.getContacts(raw);
+  if (contacts.length === 0) {
+    const needle = normalizeName(raw);
+    const fuzzy = (await adapter.getContacts())
+      .map((contact) => {
+        const names = [contact.name, contact.notifyName].filter(Boolean).map((name) => normalizeName(name!));
+        const distance = Math.min(...names.map((name) => editDistance(needle, name)), Number.POSITIVE_INFINITY);
+        return { contact, distance };
+      })
+      .filter(({ distance }) => distance <= 2)
+      .sort((a, b) => a.distance - b.distance);
+    if (fuzzy.length > 0) contacts = [fuzzy[0].contact];
+  }
+  const query = raw.toLowerCase();
+  const exact = contacts.find((c) =>
+    [c.name, c.notifyName, c.phone]
+      .filter(Boolean)
+      .some((v) => v!.toLowerCase() === query),
+  );
+  const match = exact ?? contacts[0];
+  if (!match) throw new Error(`Could not resolve contact "${raw}". Try a phone number or exact contact name.`);
+  if (contacts.length > 1 && !exact) {
+    const names = contacts.slice(0, 5).map((c) => c.name ?? c.notifyName ?? c.phone ?? c.jid).join(", ");
+    throw new Error(`Multiple contacts match "${raw}": ${names}. Use a more specific name or phone number.`);
+  }
+  const resolved = match.phone ? `${match.phone}@s.whatsapp.net` : match.jid;
+  if (!resolved || resolved.startsWith("@")) throw new Error(`Resolved invalid target for "${raw}": ${resolved}`);
+  return resolved;
+}
+
 function buildTools(adapter: BaileysAdapter) {
   return {
     sendText: tool({
@@ -52,11 +128,11 @@ function buildTools(adapter: BaileysAdapter) {
       }),
       execute: async ({ to, text, quotedMessageId }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
-        const target = to ?? ctx.currentChatId;
-        if (!target || !target.includes("@")) throw new Error(`Invalid target JID: ${target}`);
+        const target = await resolveTarget(adapter, to, ctx);
         const content: MessageContent = { type: "text", text };
         if (quotedMessageId) content.quotedMessageId = quotedMessageId;
         const res = await adapter.sendMessage(target, content);
+        rememberAgentMessage(res.messageId);
         return `Sent to ${target}. ID: ${res.messageId}`;
       },
     }),
@@ -70,7 +146,9 @@ function buildTools(adapter: BaileysAdapter) {
       }),
       execute: async ({ to, imageUrl, caption }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
-        const res = await adapter.sendMessage(to ?? ctx.currentChatId, { type: "image", image: imageUrl, caption });
+        const target = await resolveTarget(adapter, to, ctx);
+        const res = await adapter.sendMessage(target, { type: "image", image: imageUrl, caption });
+        rememberAgentMessage(res.messageId);
         return `Image sent. ID: ${res.messageId}`;
       },
     }),
@@ -84,7 +162,9 @@ function buildTools(adapter: BaileysAdapter) {
       }),
       execute: async ({ to, videoUrl, caption }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
-        const res = await adapter.sendMessage(to ?? ctx.currentChatId, { type: "video", video: videoUrl, caption });
+        const target = await resolveTarget(adapter, to, ctx);
+        const res = await adapter.sendMessage(target, { type: "video", video: videoUrl, caption });
+        rememberAgentMessage(res.messageId);
         return `Video sent. ID: ${res.messageId}`;
       },
     }),
@@ -98,7 +178,9 @@ function buildTools(adapter: BaileysAdapter) {
       }),
       execute: async ({ to, audioUrl, asVoiceNote }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
-        const res = await adapter.sendMessage(to ?? ctx.currentChatId, { type: "audio", audio: audioUrl, ptt: asVoiceNote });
+        const target = await resolveTarget(adapter, to, ctx);
+        const res = await adapter.sendMessage(target, { type: "audio", audio: audioUrl, ptt: asVoiceNote });
+        rememberAgentMessage(res.messageId);
         return `Audio sent. ID: ${res.messageId}`;
       },
     }),
@@ -113,7 +195,9 @@ function buildTools(adapter: BaileysAdapter) {
       }),
       execute: async ({ to, documentUrl, fileName, mimeType }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
-        const res = await adapter.sendMessage(to ?? ctx.currentChatId, { type: "document", document: documentUrl, fileName, mimeType });
+        const target = await resolveTarget(adapter, to, ctx);
+        const res = await adapter.sendMessage(target, { type: "document", document: documentUrl, fileName, mimeType });
+        rememberAgentMessage(res.messageId);
         return `Document sent. ID: ${res.messageId}`;
       },
     }),
@@ -129,7 +213,9 @@ function buildTools(adapter: BaileysAdapter) {
       }),
       execute: async ({ to, latitude, longitude, name, address }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
-        const res = await adapter.sendMessage(to ?? ctx.currentChatId, { type: "location", latitude, longitude, name, address });
+        const target = await resolveTarget(adapter, to, ctx);
+        const res = await adapter.sendMessage(target, { type: "location", latitude, longitude, name, address });
+        rememberAgentMessage(res.messageId);
         return `Location sent. ID: ${res.messageId}`;
       },
     }),
@@ -143,7 +229,9 @@ function buildTools(adapter: BaileysAdapter) {
       }),
       execute: async ({ to, contactName, contactPhone }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
-        const res = await adapter.sendMessage(to ?? ctx.currentChatId, { type: "contact", contactName, contactPhone });
+        const target = await resolveTarget(adapter, to, ctx);
+        const res = await adapter.sendMessage(target, { type: "contact", contactName, contactPhone });
+        rememberAgentMessage(res.messageId);
         return `Contact sent. ID: ${res.messageId}`;
       },
     }),
@@ -158,7 +246,9 @@ function buildTools(adapter: BaileysAdapter) {
       }),
       execute: async ({ to, question, options, multiSelect }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
-        const res = await adapter.sendMessage(to ?? ctx.currentChatId, { type: "poll", question, options, multiSelect });
+        const target = await resolveTarget(adapter, to, ctx);
+        const res = await adapter.sendMessage(target, { type: "poll", question, options, multiSelect });
+        rememberAgentMessage(res.messageId);
         return `Poll sent. ID: ${res.messageId}`;
       },
     }),
@@ -556,8 +646,8 @@ CAPABILITIES:
 
 CRITICAL RULES:
 - Your response TEXT is automatically sent back to the conversation. NEVER call sendText/sendImage/etc to reply in the current conversation. Only use send tools to message OTHER people.
-- To message someone by NAME, ALWAYS call searchContact first to find their JID, then use that JID in the send tool. Never use a name as the 'to' parameter.
-- You have multiple steps available. Use searchContact first, then sendText with the correct JID.
+- Send tools accept contact names, phone numbers, or JIDs. If the user says "message Bharghav", call sendText with to="Bharghav"; the app resolves it safely.
+- Use searchContact only when the user asks to look up contacts or when you need to disambiguate before answering.
 
 BEHAVIOR:
 - When the sender is YOU (self-message): treat it as a command. Execute the requested actions.
@@ -586,7 +676,6 @@ async function processMessage(
 
   const userMsg = { role: "user" as const, content: `${roleInfo}\n\n${text}` };
   const messages = [
-    { role: "system" as const, content: SYSTEM_PROMPT },
     ...history.slice(-MAX_HISTORY),
     userMsg,
   ];
@@ -596,11 +685,10 @@ async function processMessage(
 
     const result = await generateText({
       model: chatModel,
+      system: SYSTEM_PROMPT,
       messages,
       tools,
       temperature: 0.7,
-      stopWhen: stepCountIs(5),
-      allowSystemInMessages: true,
       experimental_context: { currentChatId: chatId },
     });
 
@@ -617,18 +705,22 @@ async function processMessage(
       await adapter.sendPresence(chatId, "composing");
       await new Promise((r) => setTimeout(r, 300));
       const content: MessageContent = { type: "text", text: responseText };
-      await adapter.sendMessage(chatId, content);
+      const res = await adapter.sendMessage(chatId, content);
+      rememberAgentMessage(res.messageId);
       await adapter.sendPresence(chatId, "paused");
       logger.info({ chatId, response: responseText.substring(0, 80) }, "Response sent");
     } else if (allToolCalls.length > 0) {
       logger.info({ chatId, toolCount: allToolCalls.length }, "Tools executed silently");
+      const res = await adapter.sendMessage(chatId, { type: "text", text: "Done." });
+      rememberAgentMessage(res.messageId);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.error({ err, chatId }, "Agent error");
     try {
       const fallback = "Sorry, I hit an error processing that. Please try again.";
-      await adapter.sendMessage(chatId, { type: "text", text: fallback });
+      const res = await adapter.sendMessage(chatId, { type: "text", text: fallback });
+      rememberAgentMessage(res.messageId);
     } catch (_) {}
   }
 }
@@ -700,6 +792,8 @@ async function main() {
       const msg = payload as NormalizedMessageEvent;
       const text = msg.message.content;
       if (!text) return;
+
+      if (agentSentMessages.delete(msg.message.id)) return;
 
       const dedupKey = `${msg.chatId}:${msg.message.id}:${msg.message.timestamp}`;
       if (processedMessages.has(dedupKey)) return;

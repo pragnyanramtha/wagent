@@ -72,7 +72,7 @@ async function generateWithFallback(config: WagentConfig, options: Record<string
       return await generateText({ ...(options as any), model: await getLanguageModel(config, modelName) });
     } catch (err) {
       lastError = err;
-      logger.warn({ err, model: modelName }, "Model failed, trying fallback");
+      logger.warn(`Fallback: ${modelName} failed`);
     }
   }
   throw lastError;
@@ -767,26 +767,6 @@ function withAgentPrefix(text: string): string {
   return text.trim().toLowerCase().startsWith("wagent:") ? text : `wagent: ${text}`;
 }
 
-function getBootstrapSystemPrompt(config: WagentConfig): string {
-  const notes = config.agent.bootstrapNotes;
-  const infoSoFar = notes.length > 0 ? `\nWhat I've learned so far:\n${notes.map((n, i) => `${i + 1}. ${n}`).join("\n")}` : "";
-  return `You are "wagent" — a WhatsApp AI assistant setting up for the first time.
-
-PRIORITY: Be a helpful assistant above all else. Answer questions, use tools, assist naturally.
-
-SETUP CONTEXT:
-- You need to learn: (1) your purpose / mission, (2) what to call the user, (3) your vibe/personality, (4) read/reply permissions (who can message you)
-${infoSoFar}
-
-RULES:
-- BE HELPFUL FIRST. If the user asks you to do something, just do it. Use tools as needed.
-- Let info come up naturally in conversation. Don't interrogate or force questions.
-- When the user volunteers info about your purpose/identity/vibe/permissions, make a mental note.
-- Track what you've learned. When you have enough context (3+ topics covered), you can ask "Ready to draft my system prompt?"
-- The user can say "draft prompt" or "ready" at any time to lock in the setup.
-- Be warm, natural, and conversational — like a new teammate getting oriented.`; 
-}
-
 async function sendTracked(adapter: BaileysAdapter, config: WagentConfig, to: string, text: string): Promise<void> {
   await delayBeforeReply(config);
   const res = await adapter.sendMessage(to, { type: "text", text: withAgentPrefix(text) });
@@ -795,7 +775,7 @@ async function sendTracked(adapter: BaileysAdapter, config: WagentConfig, to: st
 
 async function startBootstrap(adapter: BaileysAdapter, config: WagentConfig, myJid: string): Promise<WagentConfig> {
   if (config.agent.bootstrapStarted || config.agent.mode !== "bootstrap") return config;
-  logger.info({}, "Bootstrap started");
+  logger.info("Bootstrap started");
   await sendTracked(adapter, config, myJid, "I'm online. I don't know who I am yet.");
   await delayBeforeReply(config);
   await sendTracked(adapter, config, myJid, "I need to know my purpose, what to call you, my vibe, and who I can read/reply to. Say 'draft prompt' when you're ready to lock it in.");
@@ -804,40 +784,39 @@ async function startBootstrap(adapter: BaileysAdapter, config: WagentConfig, myJ
   return config;
 }
 
-async function handleBootstrapMessage(
+async function handleBootstrapCommand(
   adapter: BaileysAdapter,
   config: WagentConfig,
   chatId: string,
   text: string,
-  tools: ReturnType<typeof buildTools>,
-): Promise<WagentConfig> {
+): Promise<{ handled: true; config: WagentConfig } | { handled: false }> {
   if (config.agent.pendingSystemPrompt && isConfirmation(text)) {
     config.agent.systemPrompt = config.agent.pendingSystemPrompt;
     config.agent.pendingSystemPrompt = undefined;
     config.agent.memorySummary = config.agent.bootstrapNotes.join("\n").slice(-6000);
     config.agent.mode = "configured";
     saveConfig(config);
-    logger.info({}, "Bootstrap completed — system prompt confirmed");
+    logger.info("Bootstrap done — system prompt locked");
     await sendTracked(adapter, config, chatId, "Confirmed. Locked in my system prompt.");
-    return config;
+    return { handled: true, config };
   }
 
   if (config.agent.pendingSystemPrompt && !isConfirmation(text)) {
     config.agent.bootstrapNotes.push(`Feedback: ${text}`);
     config.agent.pendingSystemPrompt = undefined;
     saveConfig(config);
-    await sendTracked(adapter, config, chatId, "Draft discarded. Tell me what to change or say 'draft prompt' for a new one.");
-    return config;
+    await sendTracked(adapter, config, chatId, "Draft discarded. Say 'draft prompt' for a new one.");
+    return { handled: true, config };
   }
 
   const say = maybeExtractSayCommand(text);
   if (say) {
     await sendTracked(adapter, config, chatId, say);
-    return config;
+    return { handled: true, config };
   }
 
   if (isPromptDraftRequest(text)) {
-    logger.info({ noteCount: config.agent.bootstrapNotes.length }, "Drafting system prompt");
+    logger.info("Drafting system prompt...");
     const draft = await generateWithFallback(config, {
       system: "Draft a concise first-person system prompt for a WhatsApp agent from the user's setup notes. Include identity, purpose, vibe, read/reply boundaries, and tool behavior. Return only the prompt.",
       messages: [{ role: "user", content: config.agent.bootstrapNotes.join("\n\n") }],
@@ -845,29 +824,14 @@ async function handleBootstrapMessage(
     });
     config.agent.pendingSystemPrompt = draft.text.trim();
     saveConfig(config);
-    logger.info({ draftLen: draft.text.length }, "System prompt drafted");
     await sendTracked(adapter, config, chatId,
       `System prompt draft:\n\n${config.agent.pendingSystemPrompt}\n\nReply "confirm" if correct, or tell me what to change.`);
-    return config;
+    return { handled: true, config };
   }
 
   config.agent.bootstrapNotes.push(text);
   saveConfig(config);
-  logger.info({ chatId, noteCount: config.agent.bootstrapNotes.length }, "Bootstrap LLM call");
-
-  const result = await generateWithFallback(config, {
-    system: getBootstrapSystemPrompt(config),
-    messages: [{ role: "user", content: text }],
-    tools,
-    temperature: 0.7,
-    experimental_context: { currentChatId: chatId, config },
-  });
-
-  const responseText = result.text?.trim();
-  if (responseText) {
-    await sendTracked(adapter, config, chatId, responseText);
-  }
-  return config;
+  return { handled: false };
 }
 
 async function processMessage(
@@ -896,7 +860,7 @@ async function processMessage(
   ];
 
   try {
-    logger.info({ chatId, isSelf, text: text.substring(0, 80) }, "Processing with AI");
+    logger.info("Processing message...");
 
     const result = await generateWithFallback(config, {
       system: getSystemPrompt(config),
@@ -922,16 +886,16 @@ async function processMessage(
       const res = await adapter.sendMessage(chatId, content);
       rememberAgentMessage(res.messageId);
       await adapter.sendPresence(chatId, "paused");
-      logger.info({ chatId, response: responseText.substring(0, 80) }, "Response sent");
+      logger.info(`Response: ${responseText.substring(0, 120)}`);
     } else if (allToolCalls.length > 0) {
       const toolNames = allToolCalls.map((tc) => tc.toolName).join(", ");
-      logger.info({ chatId, toolCount: allToolCalls.length, tools: toolNames }, "Tools executed silently");
+      logger.info(`Tools: ${toolNames}`);
       const res = await adapter.sendMessage(chatId, { type: "text", text: withAgentPrefix("Done.") });
       rememberAgentMessage(res.messageId);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    logger.error({ err, chatId }, "Agent error");
+    logger.error(`Error: ${msg}`);
     try {
       const fallback = withAgentPrefix("Sorry, I hit an error processing that. Please try again.");
       const res = await adapter.sendMessage(chatId, { type: "text", text: fallback });
@@ -1011,12 +975,12 @@ async function main() {
 
   config = await ensureAiConfig(config);
 
-  logger.info({ provider: config.provider, model: config.model, mode: config.agent.mode }, "Agent configured");
+  logger.info(`Provider: ${config.provider}, Model: ${config.model}, Mode: ${config.agent.mode}`);
 
   const tools = buildTools(adapter);
   config = await startBootstrap(adapter, config, myUserJid ?? myJid);
 
-  logger.info({ jid: myUserJid, provider: config.provider, model: config.model }, "Agent ready");
+  logger.info("Agent ready");
 
   instanceManager.onAnyEvent(async (event, instId, payload) => {
     if (event === "presence.updated" && instId === instanceId) {
@@ -1045,16 +1009,15 @@ async function main() {
 
       const isOwnerSelfChat = Boolean(msg.message.isFromMe && myUserJid && msg.chatId === myUserJid);
       if (!messageCanReachAgent(config, msg, isOwnerSelfChat, text)) {
-        logger.info({ chatId: msg.chatId, text: text.substring(0, 60) }, "Message filtered out");
+        logger.info("Message filtered out");
         return;
       }
-      logger.info({ chatId: msg.chatId, isSelf: isOwnerSelfChat, text: text.substring(0, 80) }, "Message received");
 
       await waitForTypingToStop(msg.chatId);
 
       if (config.agent.mode === "bootstrap" && isOwnerSelfChat) {
-        config = await handleBootstrapMessage(adapter, config, msg.chatId, text, tools);
-        return;
+        const result = await handleBootstrapCommand(adapter, config, msg.chatId, text);
+        if (result.handled) { config = result.config; return; }
       }
 
       const senderName = await getContactName(adapter, msg.message.sender);
@@ -1064,7 +1027,7 @@ async function main() {
           : senderName;
 
       processMessage(adapter, config, instanceId, msg, text, isOwnerSelfChat, senderName, chatName, tools)
-        .catch((err) => logger.error({ err }, "processMessage error"));
+        .catch((err) => logger.error(`processMessage error: ${err instanceof Error ? err.message : err}`));
     }
   });
 }

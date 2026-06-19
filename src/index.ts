@@ -2,7 +2,7 @@ import "dotenv/config";
 import { InstanceManager } from "./services/instance-manager.js";
 import { BaileysAdapter } from "./channels/baileys/baileys.adapter.js";
 import { createChildLogger } from "./utils/logger.js";
-import { generateText, tool } from "ai";
+import { generateText, tool, stepCountIs } from "ai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { z } from "zod";
 import qrcode from "qrcode-terminal";
@@ -18,7 +18,7 @@ const groq = createOpenAICompatible({
   baseURL: process.env.GROQ_BASE_URL ?? "https://api.groq.com/openai/v1",
   apiKey: process.env.GROQ_API_KEY ?? "",
 });
-const chatModel = groq.chatModel("llama-3.3-70b-versatile");
+const chatModel = groq.chatModel(process.env.GROQ_MODEL ?? "gpt-oss-120b");
 
 const chatHistories = new Map<string, Array<{ role: "user" | "assistant"; content: string }>>();
 const MAX_HISTORY = 30;
@@ -53,10 +53,11 @@ function buildTools(adapter: BaileysAdapter) {
       execute: async ({ to, text, quotedMessageId }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
         const target = to ?? ctx.currentChatId;
+        if (!target || !target.includes("@")) throw new Error(`Invalid target JID: ${target}`);
         const content: MessageContent = { type: "text", text };
         if (quotedMessageId) content.quotedMessageId = quotedMessageId;
         const res = await adapter.sendMessage(target, content);
-        return `Sent. ID: ${res.messageId}`;
+        return `Sent to ${target}. ID: ${res.messageId}`;
       },
     }),
 
@@ -553,8 +554,10 @@ CAPABILITIES:
 - Post status/story updates
 - Archive, pin, mute chats
 
-RESPONSE RULE (CRITICAL):
-Your response TEXT is automatically sent back to the conversation. NEVER call sendText/sendImage/sendAudio/sendVideo/sendDocument/sendLocation/sendContact/sendPoll to reply in the current conversation. Only use send tools to proactively message OTHER people.
+CRITICAL RULES:
+- Your response TEXT is automatically sent back to the conversation. NEVER call sendText/sendImage/etc to reply in the current conversation. Only use send tools to message OTHER people.
+- To message someone by NAME, ALWAYS call searchContact first to find their JID, then use that JID in the send tool. Never use a name as the 'to' parameter.
+- You have multiple steps available. Use searchContact first, then sendText with the correct JID.
 
 BEHAVIOR:
 - When the sender is YOU (self-message): treat it as a command. Execute the requested actions.
@@ -596,6 +599,8 @@ async function processMessage(
       messages,
       tools,
       temperature: 0.7,
+      stopWhen: stepCountIs(5),
+      allowSystemInMessages: true,
       experimental_context: { currentChatId: chatId },
     });
 

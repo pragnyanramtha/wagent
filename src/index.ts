@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import "./quiet-console.js";
 import { InstanceManager } from "./services/instance-manager.js";
 import { BaileysAdapter } from "./channels/baileys/baileys.adapter.js";
 import { createChildLogger } from "./utils/logger.js";
@@ -20,34 +21,6 @@ const MAX_HISTORY = 30;
 const processedMessages = new Set<string>();
 const agentSentMessages = new Set<string>();
 const typingUntil = new Map<string, number>();
-
-const originalConsole = {
-  log: console.log.bind(console),
-  warn: console.warn.bind(console),
-  error: console.error.bind(console),
-};
-
-function shouldSuppressConsole(args: unknown[]): boolean {
-  if (process.argv.includes("--debug")) return false;
-  const text = args.map((arg) => (typeof arg === "string" ? arg : "")).join(" ");
-  return (
-    text.startsWith("Closing session:") ||
-    text.includes("Decrypted message with closed session") ||
-    text.includes("stream errored out") ||
-    text.includes("no name present") ||
-    text.includes("blocked on missing key")
-  );
-}
-
-console.log = (...args: unknown[]) => {
-  if (!shouldSuppressConsole(args)) originalConsole.log(...args);
-};
-console.warn = (...args: unknown[]) => {
-  if (!shouldSuppressConsole(args)) originalConsole.warn(...args);
-};
-console.error = (...args: unknown[]) => {
-  if (!shouldSuppressConsole(args)) originalConsole.error(...args);
-};
 
 function getOwnJid(adapter: BaileysAdapter): string | null {
   return adapter.getMyJid();
@@ -207,7 +180,7 @@ function buildTools(adapter: BaileysAdapter) {
       execute: async ({ to, text, quotedMessageId }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
         const target = await resolveTarget(adapter, to, ctx);
-        const content: MessageContent = { type: "text", text };
+        const content: MessageContent = { type: "text", text: withAgentPrefix(text) };
         if (quotedMessageId) content.quotedMessageId = quotedMessageId;
         await delayBeforeReply(ctx.config);
         const res = await adapter.sendMessage(target, content);
@@ -777,9 +750,17 @@ function isConfirmation(text: string): boolean {
   return /\b(confirm|confirmed|approve|approved|yes|ship it|looks good)\b/i.test(text);
 }
 
-function isReadyForPromptDraft(text: string, notes: string[]): boolean {
-  const total = notes.join(" ").length;
-  return /\b(enough|draft|write.*prompt|make.*prompt|done|that's it|that is it)\b/i.test(text) || notes.length >= 3 || total >= 500;
+function isPromptDraftRequest(text: string): boolean {
+  return /\b(enough|draft|write.*prompt|make.*prompt|system prompt|ready|done|that's it|that is it)\b/i.test(text);
+}
+
+function maybeExtractSayCommand(text: string): string | null {
+  const match = text.match(/^\s*say\s+["']?(.+?)["']?\s*$/i);
+  return match?.[1]?.trim() ?? null;
+}
+
+function withAgentPrefix(text: string): string {
+  return text.trim().toLowerCase().startsWith("wagent:") ? text : `wagent: ${text}`;
 }
 
 function nextBootstrapQuestion(notes: string[]): string {
@@ -793,14 +774,14 @@ function nextBootstrapQuestion(notes: string[]): string {
 }
 
 async function sendTracked(adapter: BaileysAdapter, to: string, text: string): Promise<void> {
-  const res = await adapter.sendMessage(to, { type: "text", text });
+  const res = await adapter.sendMessage(to, { type: "text", text: withAgentPrefix(text) });
   rememberAgentMessage(res.messageId);
 }
 
 async function startBootstrap(adapter: BaileysAdapter, config: WagentConfig, myJid: string): Promise<WagentConfig> {
   if (config.agent.bootstrapStarted || config.agent.mode !== "bootstrap") return config;
   await sendTracked(adapter, myJid, "I'm online. I don't know who I am yet.");
-  await sendTracked(adapter, myJid, "Tell me my purpose, your relationship to me, my vibe, and who I can read or reply to.");
+  await sendTracked(adapter, myJid, "Tell me my purpose, what to call you, my vibe, and who I can read/reply to. Say 'draft prompt' when ready.");
   await sendTracked(
     adapter,
     myJid,
@@ -827,8 +808,22 @@ async function handleBootstrapMessage(
     return config;
   }
 
+  if (config.agent.pendingSystemPrompt && !isConfirmation(text)) {
+    config.agent.pendingSystemPrompt = undefined;
+    config.agent.bootstrapNotes.push(`Feedback on rejected draft: ${text}`);
+    saveConfig(config);
+    await sendTracked(adapter, chatId, "Okay, I won't use that draft. Tell me what to change, or say 'draft prompt' when ready.");
+    return config;
+  }
+
+  const say = maybeExtractSayCommand(text);
+  if (say) {
+    await sendTracked(adapter, chatId, say);
+    return config;
+  }
+
   config.agent.bootstrapNotes.push(text);
-  if (!isReadyForPromptDraft(text, config.agent.bootstrapNotes)) {
+  if (!isPromptDraftRequest(text)) {
     saveConfig(config);
     await sendTracked(adapter, chatId, nextBootstrapQuestion(config.agent.bootstrapNotes));
     return config;
@@ -893,21 +888,21 @@ async function processMessage(
     if (responseText) {
       await adapter.sendPresence(chatId, "composing");
       await delayBeforeReply(config);
-      const content: MessageContent = { type: "text", text: responseText };
+      const content: MessageContent = { type: "text", text: withAgentPrefix(responseText) };
       const res = await adapter.sendMessage(chatId, content);
       rememberAgentMessage(res.messageId);
       await adapter.sendPresence(chatId, "paused");
       logger.info({ chatId, response: responseText.substring(0, 80) }, "Response sent");
     } else if (allToolCalls.length > 0) {
       logger.info({ chatId, toolCount: allToolCalls.length }, "Tools executed silently");
-      const res = await adapter.sendMessage(chatId, { type: "text", text: "Done." });
+      const res = await adapter.sendMessage(chatId, { type: "text", text: withAgentPrefix("Done.") });
       rememberAgentMessage(res.messageId);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.error({ err, chatId }, "Agent error");
     try {
-      const fallback = "Sorry, I hit an error processing that. Please try again.";
+      const fallback = withAgentPrefix("Sorry, I hit an error processing that. Please try again.");
       const res = await adapter.sendMessage(chatId, { type: "text", text: fallback });
       rememberAgentMessage(res.messageId);
     } catch (_) {}

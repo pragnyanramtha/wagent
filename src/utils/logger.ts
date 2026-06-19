@@ -9,7 +9,7 @@ const logLevel = process.argv.includes("--debug")
   ? "debug"
   : process.argv.includes("--verbose")
     ? "info"
-    : DEFAULT_LOG_LEVEL;
+    : "silent";
 const isStdio = process.env.WA_TRANSPORT === "stdio";
 
 export const logger = pino(

@@ -21,8 +21,42 @@ const processedMessages = new Set<string>();
 const agentSentMessages = new Set<string>();
 const typingUntil = new Map<string, number>();
 
+const originalConsole = {
+  log: console.log.bind(console),
+  warn: console.warn.bind(console),
+  error: console.error.bind(console),
+};
+
+function shouldSuppressConsole(args: unknown[]): boolean {
+  if (process.argv.includes("--debug")) return false;
+  const text = args.map((arg) => (typeof arg === "string" ? arg : "")).join(" ");
+  return (
+    text.startsWith("Closing session:") ||
+    text.includes("Decrypted message with closed session") ||
+    text.includes("stream errored out") ||
+    text.includes("no name present") ||
+    text.includes("blocked on missing key")
+  );
+}
+
+console.log = (...args: unknown[]) => {
+  if (!shouldSuppressConsole(args)) originalConsole.log(...args);
+};
+console.warn = (...args: unknown[]) => {
+  if (!shouldSuppressConsole(args)) originalConsole.warn(...args);
+};
+console.error = (...args: unknown[]) => {
+  if (!shouldSuppressConsole(args)) originalConsole.error(...args);
+};
+
 function getOwnJid(adapter: BaileysAdapter): string | null {
   return adapter.getMyJid();
+}
+
+function toUserJid(jid: string | null): string | null {
+  if (!jid || !jid.includes("@")) return jid;
+  const [user, domain] = jid.split("@");
+  return `${user.split(":")[0]}@${domain}`;
 }
 
 function getContactName(adapter: BaileysAdapter, jid: string): Promise<string | null> {
@@ -743,6 +777,21 @@ function isConfirmation(text: string): boolean {
   return /\b(confirm|confirmed|approve|approved|yes|ship it|looks good)\b/i.test(text);
 }
 
+function isReadyForPromptDraft(text: string, notes: string[]): boolean {
+  const total = notes.join(" ").length;
+  return /\b(enough|draft|write.*prompt|make.*prompt|done|that's it|that is it)\b/i.test(text) || notes.length >= 3 || total >= 500;
+}
+
+function nextBootstrapQuestion(notes: string[]): string {
+  const questions = [
+    "Got it. Who are you to me, and what should I call you?",
+    "What should my purpose be?",
+    "Who am I allowed to read or reply to?",
+    "What vibe should I use when I talk?",
+  ];
+  return questions[Math.min(Math.max(notes.length - 1, 0), questions.length - 1)];
+}
+
 async function sendTracked(adapter: BaileysAdapter, to: string, text: string): Promise<void> {
   const res = await adapter.sendMessage(to, { type: "text", text });
   rememberAgentMessage(res.messageId);
@@ -779,6 +828,12 @@ async function handleBootstrapMessage(
   }
 
   config.agent.bootstrapNotes.push(text);
+  if (!isReadyForPromptDraft(text, config.agent.bootstrapNotes)) {
+    saveConfig(config);
+    await sendTracked(adapter, chatId, nextBootstrapQuestion(config.agent.bootstrapNotes));
+    return config;
+  }
+
   const draft = await generateWithFallback(config, {
     system: "Draft a concise first-person system prompt for a WhatsApp agent from the user's setup notes. Include identity, purpose, vibe, read/reply boundaries, and tool behavior. Return only the prompt.",
     messages: [{ role: "user", content: config.agent.bootstrapNotes.join("\n\n") }],
@@ -894,6 +949,7 @@ async function main() {
   }
 
   let myJid: string | null = null;
+  let myUserJid: string | null = null;
 
   instanceManager.onAnyEvent((event, instId, payload) => {
     if (event === "connection.changed" && instId === instanceId) {
@@ -905,6 +961,7 @@ async function main() {
       if (conn.status === "open") {
         const adapter = instanceManager.getAdapter(instId) as BaileysAdapter;
         myJid = getOwnJid(adapter);
+        myUserJid = toUserJid(myJid);
         console.log(`\nWhatsApp connected as ${myJid}`);
       }
     }
@@ -916,7 +973,8 @@ async function main() {
 
   for (let i = 0; i < 60; i++) {
     myJid = getOwnJid(adapter);
-    if (myJid) break;
+    myUserJid = toUserJid(myJid);
+    if (myJid && myUserJid) break;
     await new Promise((r) => setTimeout(r, 1000));
   }
 
@@ -928,7 +986,7 @@ async function main() {
   config = await ensureAiConfig(config);
 
   const tools = buildTools(adapter);
-  config = await startBootstrap(adapter, config, myJid);
+  config = await startBootstrap(adapter, config, myUserJid ?? myJid);
 
   console.log("Agent ready. Message yourself to configure or command it.");
 
@@ -957,12 +1015,12 @@ async function main() {
         for (const k of toDelete) processedMessages.delete(k);
       }
 
-      const isSelf = msg.message.sender === myJid || msg.message.isFromMe;
-      if (!messageCanReachAgent(config, msg, isSelf, text)) return;
+      const isOwnerSelfChat = Boolean(msg.message.isFromMe && myUserJid && msg.chatId === myUserJid);
+      if (!messageCanReachAgent(config, msg, isOwnerSelfChat, text)) return;
 
       await waitForTypingToStop(msg.chatId);
 
-      if (config.agent.mode === "bootstrap" && isSelf) {
+      if (config.agent.mode === "bootstrap" && isOwnerSelfChat) {
         config = await handleBootstrapMessage(adapter, config, msg.chatId, text);
         return;
       }
@@ -973,7 +1031,7 @@ async function main() {
           ? await getGroupName(adapter, msg.chatId)
           : senderName;
 
-      processMessage(adapter, config, instanceId, msg, text, isSelf, senderName, chatName, tools)
+      processMessage(adapter, config, instanceId, msg, text, isOwnerSelfChat, senderName, chatName, tools)
         .catch((err) => logger.error({ err }, "processMessage error"));
     }
   });

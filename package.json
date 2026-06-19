@@ -1,6 +1,6 @@
 {
   "name": "wagent",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "WhatsApp Agent — AI-powered WhatsApp assistant using WAMCP + Groq",
   "type": "module",
   "bin": {

@@ -7,9 +7,9 @@ import { SERVER_NAME, DEFAULT_LOG_LEVEL } from "../constants.js";
 
 const logLevel = process.argv.includes("--debug")
   ? "debug"
-  : process.argv.includes("--verbose")
-    ? "info"
-    : "silent";
+  : process.env.LOG_LEVEL
+    ? process.env.LOG_LEVEL
+    : "info";
 const isStdio = process.env.WA_TRANSPORT === "stdio";
 
 export const logger = pino(

@@ -791,6 +791,7 @@ async function sendTracked(adapter: BaileysAdapter, config: WagentConfig, to: st
 
 async function startBootstrap(adapter: BaileysAdapter, config: WagentConfig, myJid: string): Promise<WagentConfig> {
   if (config.agent.bootstrapStarted || config.agent.mode !== "bootstrap") return config;
+  logger.info({}, "Bootstrap started");
   await sendTracked(adapter, config, myJid, "I'm online. I don't know who I am yet.");
   await delayBeforeReply(config);
   await sendTracked(adapter, config, myJid, "I need to know my purpose, what to call you, my vibe, and who I can read/reply to. Say 'draft prompt' when you're ready to lock it in.");
@@ -812,6 +813,7 @@ async function handleBootstrapMessage(
     config.agent.memorySummary = config.agent.bootstrapNotes.join("\n").slice(-6000);
     config.agent.mode = "configured";
     saveConfig(config);
+    logger.info({}, "Bootstrap completed — system prompt confirmed");
     await sendTracked(adapter, config, chatId, "Confirmed. Locked in my system prompt.");
     return config;
   }
@@ -831,6 +833,7 @@ async function handleBootstrapMessage(
   }
 
   if (isPromptDraftRequest(text)) {
+    logger.info({ noteCount: config.agent.bootstrapNotes.length }, "Drafting system prompt");
     const draft = await generateWithFallback(config, {
       system: "Draft a concise first-person system prompt for a WhatsApp agent from the user's setup notes. Include identity, purpose, vibe, read/reply boundaries, and tool behavior. Return only the prompt.",
       messages: [{ role: "user", content: config.agent.bootstrapNotes.join("\n\n") }],
@@ -838,6 +841,7 @@ async function handleBootstrapMessage(
     });
     config.agent.pendingSystemPrompt = draft.text.trim();
     saveConfig(config);
+    logger.info({ draftLen: draft.text.length }, "System prompt drafted");
     await sendTracked(adapter, config, chatId,
       `System prompt draft:\n\n${config.agent.pendingSystemPrompt}\n\nReply "confirm" if correct, or tell me what to change.`);
     return config;
@@ -845,6 +849,7 @@ async function handleBootstrapMessage(
 
   config.agent.bootstrapNotes.push(text);
   saveConfig(config);
+  logger.info({ chatId, noteCount: config.agent.bootstrapNotes.length }, "Bootstrap LLM call");
 
   const result = await generateWithFallback(config, {
     system: getBootstrapSystemPrompt(config),
@@ -915,7 +920,8 @@ async function processMessage(
       await adapter.sendPresence(chatId, "paused");
       logger.info({ chatId, response: responseText.substring(0, 80) }, "Response sent");
     } else if (allToolCalls.length > 0) {
-      logger.info({ chatId, toolCount: allToolCalls.length }, "Tools executed silently");
+      const toolNames = allToolCalls.map((tc) => tc.toolName).join(", ");
+      logger.info({ chatId, toolCount: allToolCalls.length, tools: toolNames }, "Tools executed silently");
       const res = await adapter.sendMessage(chatId, { type: "text", text: withAgentPrefix("Done.") });
       rememberAgentMessage(res.messageId);
     }
@@ -1001,10 +1007,12 @@ async function main() {
 
   config = await ensureAiConfig(config);
 
+  logger.info({ provider: config.provider, model: config.model, mode: config.agent.mode }, "Agent configured");
+
   const tools = buildTools(adapter);
   config = await startBootstrap(adapter, config, myUserJid ?? myJid);
 
-  console.log("Agent ready. Message yourself to configure or command it.");
+  logger.info({ jid: myUserJid, provider: config.provider, model: config.model }, "Agent ready");
 
   instanceManager.onAnyEvent(async (event, instId, payload) => {
     if (event === "presence.updated" && instId === instanceId) {
@@ -1032,7 +1040,11 @@ async function main() {
       }
 
       const isOwnerSelfChat = Boolean(msg.message.isFromMe && myUserJid && msg.chatId === myUserJid);
-      if (!messageCanReachAgent(config, msg, isOwnerSelfChat, text)) return;
+      if (!messageCanReachAgent(config, msg, isOwnerSelfChat, text)) {
+        logger.info({ chatId: msg.chatId, text: text.substring(0, 60) }, "Message filtered out");
+        return;
+      }
+      logger.info({ chatId: msg.chatId, isSelf: isOwnerSelfChat, text: text.substring(0, 80) }, "Message received");
 
       await waitForTypingToStop(msg.chatId);
 

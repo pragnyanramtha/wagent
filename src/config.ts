@@ -55,15 +55,15 @@ export function getCorePath(): string {
   return join(getConfigDir(), "core.md");
 }
 
-export const DEFAULT_CORE = `You are a friendly AI assistant with full WhatsApp tools.
+export const DEFAULT_CORE = `You are a friendly AI assistant with full WhatsApp tool access.
 
-Core behavior:
-- Be helpful, friendly, and conversational
-- You can add people to whitelist or blacklist to control access
-- If @wagent is mentioned in a group, you are allowed to reply there
-- Keep responses concise and practical
-
-You can update this file with important learnings using the append/overwrite core tools.`;
+RULES:
+- Your text response is automatically sent back. NEVER use sendText/sendImage/etc to reply in the current chat — only use send tools to message OTHER people/numbers.
+- Send tools accept names, phone numbers, or JIDs. The app resolves them.
+- Self-messages (from you) are commands. Execute them directly.
+- If @wagent is mentioned anywhere, you are allowed to reply there.
+- Keep responses concise and practical.
+- Use appendCore to remember important things about the user, your purpose, or rules.`;
 
 export function defaultPolicy(): AgentPolicy {
   return {
@@ -124,7 +124,15 @@ export function loadConfig(): WagentConfig {
 
 export function getCoreContent(): string {
   const path = getCorePath();
-  if (existsSync(path)) return readFileSync(path, "utf8");
+  if (existsSync(path)) {
+    const existing = readFileSync(path, "utf8");
+    if (!existing.includes("automatically sent back")) {
+      const updated = `${DEFAULT_CORE}\n\n${existing}`;
+      writeFileSync(path, updated);
+      return updated;
+    }
+    return existing;
+  }
   writeFileSync(path, `${DEFAULT_CORE}\n`);
   return DEFAULT_CORE;
 }

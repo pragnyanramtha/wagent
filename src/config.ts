@@ -86,7 +86,7 @@ export function defaultConfig(): WagentConfig {
     model: "gemini-3.1-flash-lite",
     fallbackModels: ["gemma-4-31b", "gemma-4-27b"],
     replyDelayMinMs: 2000,
-    replyDelayMaxMs: 8000,
+    replyDelayMaxMs: 4000,
     agent: defaultAgentState(),
   };
 }

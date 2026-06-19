@@ -86,6 +86,10 @@ async function delayBeforeReply(config: WagentConfig): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, randomBetween(config.replyDelayMinMs, config.replyDelayMaxMs)));
 }
 
+async function minDelayBeforeReply(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, randomBetween(500, 1500)));
+}
+
 async function waitForTypingToStop(chatId: string): Promise<void> {
   const started = Date.now();
   while ((typingUntil.get(chatId) ?? 0) > Date.now() && Date.now() - started < 30_000) {
@@ -182,7 +186,7 @@ function buildTools(adapter: BaileysAdapter) {
         const target = await resolveTarget(adapter, to, ctx);
         const content: MessageContent = { type: "text", text: withAgentPrefix(text) };
         if (quotedMessageId) content.quotedMessageId = quotedMessageId;
-        await delayBeforeReply(ctx.config);
+        await minDelayBeforeReply();
         const res = await adapter.sendMessage(target, content);
         rememberAgentMessage(res.messageId);
         return `Sent to ${target}. ID: ${res.messageId}`;
@@ -199,7 +203,7 @@ function buildTools(adapter: BaileysAdapter) {
       execute: async ({ to, imageUrl, caption }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
         const target = await resolveTarget(adapter, to, ctx);
-        await delayBeforeReply(ctx.config);
+        await minDelayBeforeReply();
         const res = await adapter.sendMessage(target, { type: "image", image: imageUrl, caption });
         rememberAgentMessage(res.messageId);
         return `Image sent. ID: ${res.messageId}`;
@@ -216,7 +220,7 @@ function buildTools(adapter: BaileysAdapter) {
       execute: async ({ to, videoUrl, caption }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
         const target = await resolveTarget(adapter, to, ctx);
-        await delayBeforeReply(ctx.config);
+        await minDelayBeforeReply();
         const res = await adapter.sendMessage(target, { type: "video", video: videoUrl, caption });
         rememberAgentMessage(res.messageId);
         return `Video sent. ID: ${res.messageId}`;
@@ -233,7 +237,7 @@ function buildTools(adapter: BaileysAdapter) {
       execute: async ({ to, audioUrl, asVoiceNote }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
         const target = await resolveTarget(adapter, to, ctx);
-        await delayBeforeReply(ctx.config);
+        await minDelayBeforeReply();
         const res = await adapter.sendMessage(target, { type: "audio", audio: audioUrl, ptt: asVoiceNote });
         rememberAgentMessage(res.messageId);
         return `Audio sent. ID: ${res.messageId}`;
@@ -251,7 +255,7 @@ function buildTools(adapter: BaileysAdapter) {
       execute: async ({ to, documentUrl, fileName, mimeType }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
         const target = await resolveTarget(adapter, to, ctx);
-        await delayBeforeReply(ctx.config);
+        await minDelayBeforeReply();
         const res = await adapter.sendMessage(target, { type: "document", document: documentUrl, fileName, mimeType });
         rememberAgentMessage(res.messageId);
         return `Document sent. ID: ${res.messageId}`;
@@ -270,7 +274,7 @@ function buildTools(adapter: BaileysAdapter) {
       execute: async ({ to, latitude, longitude, name, address }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
         const target = await resolveTarget(adapter, to, ctx);
-        await delayBeforeReply(ctx.config);
+        await minDelayBeforeReply();
         const res = await adapter.sendMessage(target, { type: "location", latitude, longitude, name, address });
         rememberAgentMessage(res.messageId);
         return `Location sent. ID: ${res.messageId}`;
@@ -287,7 +291,7 @@ function buildTools(adapter: BaileysAdapter) {
       execute: async ({ to, contactName, contactPhone }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
         const target = await resolveTarget(adapter, to, ctx);
-        await delayBeforeReply(ctx.config);
+        await minDelayBeforeReply();
         const res = await adapter.sendMessage(target, { type: "contact", contactName, contactPhone });
         rememberAgentMessage(res.messageId);
         return `Contact sent. ID: ${res.messageId}`;
@@ -305,7 +309,7 @@ function buildTools(adapter: BaileysAdapter) {
       execute: async ({ to, question, options, multiSelect }, { experimental_context }: any) => {
         const ctx = experimental_context as ChatCtx;
         const target = await resolveTarget(adapter, to, ctx);
-        await delayBeforeReply(ctx.config);
+        await minDelayBeforeReply();
         const res = await adapter.sendMessage(target, { type: "poll", question, options, multiSelect });
         rememberAgentMessage(res.messageId);
         return `Poll sent. ID: ${res.messageId}`;

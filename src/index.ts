@@ -763,30 +763,37 @@ function withAgentPrefix(text: string): string {
   return text.trim().toLowerCase().startsWith("wagent:") ? text : `wagent: ${text}`;
 }
 
-function nextBootstrapQuestion(notes: string[]): string {
-  const questions = [
-    "Got it. Who are you to me, and what should I call you?",
-    "What should my purpose be?",
-    "Who am I allowed to read or reply to?",
-    "What vibe should I use when I talk?",
-  ];
-  return questions[Math.min(Math.max(notes.length - 1, 0), questions.length - 1)];
+function getBootstrapSystemPrompt(config: WagentConfig): string {
+  const notes = config.agent.bootstrapNotes;
+  const infoSoFar = notes.length > 0 ? `\nWhat I've learned so far:\n${notes.map((n, i) => `${i + 1}. ${n}`).join("\n")}` : "";
+  return `You are "wagent" — a WhatsApp AI assistant setting up for the first time.
+
+PRIORITY: Be a helpful assistant above all else. Answer questions, use tools, assist naturally.
+
+SETUP CONTEXT:
+- You need to learn: (1) your purpose / mission, (2) what to call the user, (3) your vibe/personality, (4) read/reply permissions (who can message you)
+${infoSoFar}
+
+RULES:
+- BE HELPFUL FIRST. If the user asks you to do something, just do it. Use tools as needed.
+- Let info come up naturally in conversation. Don't interrogate or force questions.
+- When the user volunteers info about your purpose/identity/vibe/permissions, make a mental note.
+- Track what you've learned. When you have enough context (3+ topics covered), you can ask "Ready to draft my system prompt?"
+- The user can say "draft prompt" or "ready" at any time to lock in the setup.
+- Be warm, natural, and conversational — like a new teammate getting oriented.`; 
 }
 
-async function sendTracked(adapter: BaileysAdapter, to: string, text: string): Promise<void> {
+async function sendTracked(adapter: BaileysAdapter, config: WagentConfig, to: string, text: string): Promise<void> {
+  await delayBeforeReply(config);
   const res = await adapter.sendMessage(to, { type: "text", text: withAgentPrefix(text) });
   rememberAgentMessage(res.messageId);
 }
 
 async function startBootstrap(adapter: BaileysAdapter, config: WagentConfig, myJid: string): Promise<WagentConfig> {
   if (config.agent.bootstrapStarted || config.agent.mode !== "bootstrap") return config;
-  await sendTracked(adapter, myJid, "I'm online. I don't know who I am yet.");
-  await sendTracked(adapter, myJid, "Tell me my purpose, what to call you, my vibe, and who I can read/reply to. Say 'draft prompt' when ready.");
-  await sendTracked(
-    adapter,
-    myJid,
-    "I can message contacts, manage WhatsApp tools, remember context, compact memory, and enforce read/reply permissions.",
-  );
+  await sendTracked(adapter, config, myJid, "I'm online. I don't know who I am yet.");
+  await delayBeforeReply(config);
+  await sendTracked(adapter, config, myJid, "I need to know my purpose, what to call you, my vibe, and who I can read/reply to. Say 'draft prompt' when you're ready to lock it in.");
   config.agent.bootstrapStarted = true;
   saveConfig(config);
   return config;
@@ -797,6 +804,7 @@ async function handleBootstrapMessage(
   config: WagentConfig,
   chatId: string,
   text: string,
+  tools: ReturnType<typeof buildTools>,
 ): Promise<WagentConfig> {
   if (config.agent.pendingSystemPrompt && isConfirmation(text)) {
     config.agent.systemPrompt = config.agent.pendingSystemPrompt;
@@ -804,39 +812,52 @@ async function handleBootstrapMessage(
     config.agent.memorySummary = config.agent.bootstrapNotes.join("\n").slice(-6000);
     config.agent.mode = "configured";
     saveConfig(config);
-    await sendTracked(adapter, chatId, "Confirmed. I compacted setup context and will follow this system prompt from now on.");
+    await sendTracked(adapter, config, chatId, "Confirmed. Locked in my system prompt.");
     return config;
   }
 
   if (config.agent.pendingSystemPrompt && !isConfirmation(text)) {
+    config.agent.bootstrapNotes.push(`Feedback: ${text}`);
     config.agent.pendingSystemPrompt = undefined;
-    config.agent.bootstrapNotes.push(`Feedback on rejected draft: ${text}`);
     saveConfig(config);
-    await sendTracked(adapter, chatId, "Okay, I won't use that draft. Tell me what to change, or say 'draft prompt' when ready.");
+    await sendTracked(adapter, config, chatId, "Draft discarded. Tell me what to change or say 'draft prompt' for a new one.");
     return config;
   }
 
   const say = maybeExtractSayCommand(text);
   if (say) {
-    await sendTracked(adapter, chatId, say);
+    await sendTracked(adapter, config, chatId, say);
+    return config;
+  }
+
+  if (isPromptDraftRequest(text)) {
+    const draft = await generateWithFallback(config, {
+      system: "Draft a concise first-person system prompt for a WhatsApp agent from the user's setup notes. Include identity, purpose, vibe, read/reply boundaries, and tool behavior. Return only the prompt.",
+      messages: [{ role: "user", content: config.agent.bootstrapNotes.join("\n\n") }],
+      temperature: 0.3,
+    });
+    config.agent.pendingSystemPrompt = draft.text.trim();
+    saveConfig(config);
+    await sendTracked(adapter, config, chatId,
+      `System prompt draft:\n\n${config.agent.pendingSystemPrompt}\n\nReply "confirm" if correct, or tell me what to change.`);
     return config;
   }
 
   config.agent.bootstrapNotes.push(text);
-  if (!isPromptDraftRequest(text)) {
-    saveConfig(config);
-    await sendTracked(adapter, chatId, nextBootstrapQuestion(config.agent.bootstrapNotes));
-    return config;
-  }
-
-  const draft = await generateWithFallback(config, {
-    system: "Draft a concise first-person system prompt for a WhatsApp agent from the user's setup notes. Include identity, purpose, vibe, read/reply boundaries, and tool behavior. Return only the prompt.",
-    messages: [{ role: "user", content: config.agent.bootstrapNotes.join("\n\n") }],
-    temperature: 0.3,
-  });
-  config.agent.pendingSystemPrompt = draft.text.trim();
   saveConfig(config);
-  await sendTracked(adapter, chatId, `Here's my proposed system prompt:\n\n${config.agent.pendingSystemPrompt}\n\nReply confirm if this is right, or tell me what to change.`);
+
+  const result = await generateWithFallback(config, {
+    system: getBootstrapSystemPrompt(config),
+    messages: [{ role: "user", content: text }],
+    tools,
+    temperature: 0.7,
+    experimental_context: { currentChatId: chatId, config },
+  });
+
+  const responseText = result.text?.trim();
+  if (responseText) {
+    await sendTracked(adapter, config, chatId, responseText);
+  }
   return config;
 }
 
@@ -1016,7 +1037,7 @@ async function main() {
       await waitForTypingToStop(msg.chatId);
 
       if (config.agent.mode === "bootstrap" && isOwnerSelfChat) {
-        config = await handleBootstrapMessage(adapter, config, msg.chatId, text);
+        config = await handleBootstrapMessage(adapter, config, msg.chatId, text, tools);
         return;
       }
 

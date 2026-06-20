@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import "./quiet-console.js";
 import { InstanceManager } from "./services/instance-manager.js";
-import { BaileysAdapter } from "./channels/baileys/baileys.adapter.js";
+import type { ChannelAdapter } from "./channels/channel.interface.js";
 import { createChildLogger } from "./utils/logger.js";
 import { generateText, tool } from "ai";
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
@@ -16,13 +16,111 @@ import type {
 } from "./types/channel.types.js";
 const logger = createChildLogger({ service: "wagent" });
 
-const chatHistories = new Map<string, Array<{ role: "user" | "assistant"; content: string }>>();
+// ---- Chat history with LRU eviction ----
+
 const MAX_HISTORY = 30;
-const processedMessages = new Set<string>();
-const agentSentMessages = new Set<string>();
+const MAX_HISTORY_CHATS = 200;
+
+class LRUChatHistory {
+  private map = new Map<string, Array<{ role: "user" | "assistant"; content: string }>>();
+
+  get(key: string): Array<{ role: "user" | "assistant"; content: string }> {
+    const val = this.map.get(key);
+    if (val) {
+      // Move to end (most recently used)
+      this.map.delete(key);
+      this.map.set(key, val);
+    }
+    return val ?? [];
+  }
+
+  set(key: string, value: Array<{ role: "user" | "assistant"; content: string }>): void {
+    this.map.delete(key);
+    this.map.set(key, value);
+    // Evict oldest entries
+    while (this.map.size > MAX_HISTORY_CHATS) {
+      const oldest = this.map.keys().next().value;
+      if (oldest) this.map.delete(oldest);
+    }
+  }
+}
+
+const chatHistories = new LRUChatHistory();
+
+// ---- Bounded dedup set with timestamp-based eviction ----
+
+const MAX_DEDUP = 2000;
+const DEDUP_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+class BoundedDedupMap {
+  private map = new Map<string, number>();
+
+  has(key: string): boolean {
+    return this.map.has(key);
+  }
+
+  add(key: string): void {
+    this.map.set(key, Date.now());
+    if (this.map.size > MAX_DEDUP) {
+      this.prune();
+    }
+  }
+
+  delete(key: string): boolean {
+    return this.map.delete(key);
+  }
+
+  private prune(): void {
+    const now = Date.now();
+    for (const [key, ts] of this.map) {
+      if (now - ts > DEDUP_TTL_MS || this.map.size > MAX_DEDUP) {
+        this.map.delete(key);
+      }
+      if (this.map.size <= MAX_DEDUP / 2) break;
+    }
+  }
+}
+
+const processedMessages = new BoundedDedupMap();
+
+// ---- Per-chat processing lock ----
+
+const chatLocks = new Map<string, Promise<void>>();
+
+async function withChatLock(chatId: string, fn: () => Promise<void>): Promise<void> {
+  const prev = chatLocks.get(chatId) ?? Promise.resolve();
+  const current = prev.then(fn, fn);
+  chatLocks.set(chatId, current);
+  try {
+    await current;
+  } finally {
+    // Clean up if this is still the latest promise
+    if (chatLocks.get(chatId) === current) {
+      chatLocks.delete(chatId);
+    }
+  }
+}
+
+// ---- Typing tracker ----
+
 const typingUntil = new Map<string, number>();
 
-function getOwnJid(adapter: BaileysAdapter): string | null {
+// ---- Agent prefix for self-message detection ----
+
+const AGENT_PREFIX = "wagent:";
+
+function isAgentMessage(text: string): boolean {
+  return text.trimStart().toLowerCase().startsWith(AGENT_PREFIX);
+}
+
+function withAgentPrefix(text: string): string {
+  if (isAgentMessage(text)) return text;
+  return `wagent: ${text}`;
+}
+
+// ---- Helpers ----
+
+function getOwnJid(adapter: ChannelAdapter): string | null {
   return adapter.getMyJid();
 }
 
@@ -32,14 +130,14 @@ function toUserJid(jid: string | null): string | null {
   return `${user.split(":")[0]}@${domain}`;
 }
 
-function getContactName(adapter: BaileysAdapter, jid: string): Promise<string | null> {
+function getContactName(adapter: ChannelAdapter, jid: string): Promise<string | null> {
   return adapter.getContacts(jid).then((c) => {
     const match = c.find((x) => x.jid === jid);
     return match?.name ?? match?.notifyName ?? jid.split("@")[0] ?? null;
   });
 }
 
-function getGroupName(adapter: BaileysAdapter, jid: string): Promise<string> {
+function getGroupName(adapter: ChannelAdapter, jid: string): Promise<string> {
   return adapter.getGroupMetadata(jid).then((g) => g.subject).catch(() => jid.split("@")[0]);
 }
 
@@ -65,14 +163,48 @@ async function getLanguageModel(config: WagentConfig, modelName: string): Promis
   return provider.chatModel(modelName);
 }
 
+// ---- Retriable error detection ----
+
+function isRetriableError(err: unknown): boolean {
+  if (!(err instanceof Error)) return true; // unknown errors are retriable
+  const msg = err.message.toLowerCase();
+
+  // Auth/config errors — don't retry
+  if (msg.includes("401") || msg.includes("unauthorized")) return false;
+  if (msg.includes("403") || msg.includes("forbidden")) return false;
+  if (msg.includes("invalid api key") || msg.includes("invalid_api_key")) return false;
+  if (msg.includes("invalid model") || msg.includes("model not found")) return false;
+
+  // Check for HTTP status in error
+  const anyErr = err as any;
+  const status = anyErr.status ?? anyErr.statusCode ?? anyErr.response?.status;
+  if (status === 401 || status === 403 || status === 400) return false;
+
+  return true;
+}
+
 async function generateWithFallback(config: WagentConfig, options: Record<string, unknown>) {
   let lastError: unknown;
-  for (const modelName of getModelNames(config)) {
+  const models = getModelNames(config);
+
+  for (let i = 0; i < models.length; i++) {
+    const modelName = models[i];
     try {
       return await generateText({ ...(options as any), model: await getLanguageModel(config, modelName) });
     } catch (err) {
       lastError = err;
-      logger.warn(`Fallback: ${modelName} failed`);
+      const errMsg = err instanceof Error ? err.message : String(err);
+
+      if (!isRetriableError(err)) {
+        logger.error(`Model ${modelName} failed with non-retriable error: ${errMsg}`);
+        throw err;
+      }
+
+      if (i < models.length - 1) {
+        logger.warn(`Model ${modelName} failed (retriable), trying next: ${errMsg.substring(0, 120)}`);
+      } else {
+        logger.error(`All models exhausted. Last error: ${errMsg.substring(0, 200)}`);
+      }
     }
   }
   throw lastError;
@@ -94,15 +226,6 @@ async function waitForTypingToStop(chatId: string): Promise<void> {
   const started = Date.now();
   while ((typingUntil.get(chatId) ?? 0) > Date.now() && Date.now() - started < 30_000) {
     await new Promise((resolve) => setTimeout(resolve, 750));
-  }
-}
-
-function rememberAgentMessage(messageId: string): void {
-  if (!messageId) return;
-  agentSentMessages.add(messageId);
-  if (agentSentMessages.size > 1000) {
-    const toDelete = [...agentSentMessages].slice(0, 500);
-    for (const id of toDelete) agentSentMessages.delete(id);
   }
 }
 
@@ -131,7 +254,7 @@ function editDistance(a: string, b: string): number {
   return dp[a.length][b.length];
 }
 
-async function resolveTarget(adapter: BaileysAdapter, to: string | undefined, ctx: ChatCtx): Promise<string> {
+async function resolveTarget(adapter: ChannelAdapter, to: string | undefined, ctx: ChatCtx): Promise<string> {
   const raw = to?.trim();
   if (!raw) return ctx.currentChatId;
   if (raw.includes("@")) {
@@ -172,7 +295,7 @@ async function resolveTarget(adapter: BaileysAdapter, to: string | undefined, ct
   return resolved;
 }
 
-function buildTools(adapter: BaileysAdapter) {
+function buildTools(adapter: ChannelAdapter) {
   return {
     sendText: tool({
       description: "Send a text message to a phone number or JID. Omit 'to' to send to the current conversation.",
@@ -188,7 +311,6 @@ function buildTools(adapter: BaileysAdapter) {
         if (quotedMessageId) content.quotedMessageId = quotedMessageId;
         await minDelayBeforeReply();
         const res = await adapter.sendMessage(target, content);
-        rememberAgentMessage(res.messageId);
         return `Sent to ${target}. ID: ${res.messageId}`;
       },
     }),
@@ -205,7 +327,6 @@ function buildTools(adapter: BaileysAdapter) {
         const target = await resolveTarget(adapter, to, ctx);
         await minDelayBeforeReply();
         const res = await adapter.sendMessage(target, { type: "image", image: imageUrl, caption });
-        rememberAgentMessage(res.messageId);
         return `Image sent. ID: ${res.messageId}`;
       },
     }),
@@ -222,7 +343,6 @@ function buildTools(adapter: BaileysAdapter) {
         const target = await resolveTarget(adapter, to, ctx);
         await minDelayBeforeReply();
         const res = await adapter.sendMessage(target, { type: "video", video: videoUrl, caption });
-        rememberAgentMessage(res.messageId);
         return `Video sent. ID: ${res.messageId}`;
       },
     }),
@@ -239,7 +359,6 @@ function buildTools(adapter: BaileysAdapter) {
         const target = await resolveTarget(adapter, to, ctx);
         await minDelayBeforeReply();
         const res = await adapter.sendMessage(target, { type: "audio", audio: audioUrl, ptt: asVoiceNote });
-        rememberAgentMessage(res.messageId);
         return `Audio sent. ID: ${res.messageId}`;
       },
     }),
@@ -257,7 +376,6 @@ function buildTools(adapter: BaileysAdapter) {
         const target = await resolveTarget(adapter, to, ctx);
         await minDelayBeforeReply();
         const res = await adapter.sendMessage(target, { type: "document", document: documentUrl, fileName, mimeType });
-        rememberAgentMessage(res.messageId);
         return `Document sent. ID: ${res.messageId}`;
       },
     }),
@@ -276,7 +394,6 @@ function buildTools(adapter: BaileysAdapter) {
         const target = await resolveTarget(adapter, to, ctx);
         await minDelayBeforeReply();
         const res = await adapter.sendMessage(target, { type: "location", latitude, longitude, name, address });
-        rememberAgentMessage(res.messageId);
         return `Location sent. ID: ${res.messageId}`;
       },
     }),
@@ -293,7 +410,6 @@ function buildTools(adapter: BaileysAdapter) {
         const target = await resolveTarget(adapter, to, ctx);
         await minDelayBeforeReply();
         const res = await adapter.sendMessage(target, { type: "contact", contactName, contactPhone });
-        rememberAgentMessage(res.messageId);
         return `Contact sent. ID: ${res.messageId}`;
       },
     }),
@@ -311,7 +427,6 @@ function buildTools(adapter: BaileysAdapter) {
         const target = await resolveTarget(adapter, to, ctx);
         await minDelayBeforeReply();
         const res = await adapter.sendMessage(target, { type: "poll", question, options, multiSelect });
-        rememberAgentMessage(res.messageId);
         return `Poll sent. ID: ${res.messageId}`;
       },
     }),
@@ -732,8 +847,19 @@ function loadCore(): void {
   coreContent = getCoreContent();
 }
 
-function getSystemPrompt(): string {
-  return coreContent;
+function buildSystemPrompt(myJid: string | null, chatId: string, senderName: string | null, chatName: string | null, isSelf: boolean): string {
+  const now = new Date().toISOString();
+  const contextLines: string[] = [];
+
+  contextLines.push(`Current time: ${now}`);
+  if (myJid) contextLines.push(`Your WhatsApp JID: ${myJid}`);
+  contextLines.push(`Current chat: ${chatId}`);
+  if (chatName && chatName !== chatId) contextLines.push(`Chat name: ${chatName}`);
+  if (senderName) contextLines.push(`Sender: ${senderName}`);
+  if (isSelf) contextLines.push(`This is a self-message (command from the owner).`);
+  if (chatId.endsWith("@g.us")) contextLines.push(`This is a group chat.`);
+
+  return `${coreContent}\n\n--- CONTEXT ---\n${contextLines.join("\n")}`;
 }
 
 function hasMentionBypass(text: string, config: WagentConfig): boolean {
@@ -760,18 +886,8 @@ function messageCanReachAgent(config: WagentConfig, event: NormalizedMessageEven
   return false;
 }
 
-function withAgentPrefix(text: string): string {
-  return text.trim().toLowerCase().startsWith("wagent:") ? text : `wagent: ${text}`;
-}
-
-async function sendTracked(adapter: BaileysAdapter, config: WagentConfig, to: string, text: string): Promise<void> {
-  await delayBeforeReply(config);
-  const res = await adapter.sendMessage(to, { type: "text", text: withAgentPrefix(text) });
-  rememberAgentMessage(res.messageId);
-}
-
 async function processMessage(
-  adapter: BaileysAdapter,
+  adapter: ChannelAdapter,
   config: WagentConfig,
   instId: string,
   event: NormalizedMessageEvent,
@@ -780,10 +896,11 @@ async function processMessage(
   senderName: string | null,
   chatName: string | null,
   tools: ReturnType<typeof buildTools>,
+  myJid: string | null,
 ) {
   const { chatId } = event;
   const chatKey = `${instId}:${chatId}`;
-  const history = chatHistories.get(chatKey) ?? [];
+  const history = chatHistories.get(chatKey);
 
   const roleInfo = isSelf
     ? `[COMMAND from ${senderName ?? "you"} (self-message) | chat: ${chatId}]`
@@ -796,47 +913,48 @@ async function processMessage(
   ];
 
   try {
-    logger.info("Processing message...");
+    logger.info({ chatId, sender: event.message.sender, isSelf }, "Processing message");
+
+    const systemPrompt = buildSystemPrompt(myJid, chatId, senderName, chatName, isSelf);
 
     const result = await generateWithFallback(config, {
-      system: getSystemPrompt(),
+      system: systemPrompt,
       messages,
       tools,
+      maxSteps: 15,
       temperature: 0.7,
       experimental_context: { currentChatId: chatId, config },
     });
 
     const responseText = result.text?.trim();
-    const allToolCalls = result.steps?.flatMap((s) => s.toolCalls ?? []) ?? [];
+    const allToolCalls = result.steps?.flatMap((s: any) => s.toolCalls ?? []) ?? [];
 
+    // Update history
     if (allToolCalls.length > 0 || responseText) {
-      history.push(userMsg);
-      history.push({ role: "assistant", content: responseText || "(done)" });
-      chatHistories.set(chatKey, history);
+      const updatedHistory = [...history, userMsg];
+      if (responseText) {
+        updatedHistory.push({ role: "assistant", content: responseText });
+      }
+      chatHistories.set(chatKey, updatedHistory);
     }
 
+    // Send text response if the model produced one
     if (responseText) {
       await adapter.sendPresence(chatId, "composing");
       await delayBeforeReply(config);
       const content: MessageContent = { type: "text", text: withAgentPrefix(responseText) };
-      const res = await adapter.sendMessage(chatId, content);
-      rememberAgentMessage(res.messageId);
+      await adapter.sendMessage(chatId, content);
       await adapter.sendPresence(chatId, "paused");
-      logger.info(`Response: ${responseText.substring(0, 120)}`);
+      logger.info({ chatId, responseLength: responseText.length }, `Response sent`);
     } else if (allToolCalls.length > 0) {
-      const toolNames = allToolCalls.map((tc) => tc.toolName).join(", ");
-      logger.info(`Tools: ${toolNames}`);
-      const res = await adapter.sendMessage(chatId, { type: "text", text: withAgentPrefix("Done.") });
-      rememberAgentMessage(res.messageId);
+      const toolNames = allToolCalls.map((tc: any) => tc.toolName).join(", ");
+      logger.info({ chatId, tools: toolNames }, "Tools executed (no text response)");
+      // No fallback text — tools already performed their actions
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    logger.error(`Error: ${msg}`);
-    try {
-      const fallback = withAgentPrefix("Sorry, I hit an error processing that. Please try again.");
-      const res = await adapter.sendMessage(chatId, { type: "text", text: fallback });
-      rememberAgentMessage(res.messageId);
-    } catch (_) {}
+    logger.error({ chatId, error: msg }, "Failed to process message");
+    // No fallback error message sent to user
   }
 }
 
@@ -885,7 +1003,7 @@ async function main() {
         qrcode.generate(conn.qrCode, { small: true });
       }
       if (conn.status === "open") {
-        const adapter = instanceManager.getAdapter(instId) as BaileysAdapter;
+        const adapter = instanceManager.getAdapter(instId) as ChannelAdapter;
         myJid = getOwnJid(adapter);
         myUserJid = toUserJid(myJid);
         console.log(`\nWhatsApp connected as ${myJid}`);
@@ -895,7 +1013,7 @@ async function main() {
 
   await instanceManager.connectInstance(instanceId);
 
-  const adapter = instanceManager.getAdapter(instanceId) as BaileysAdapter;
+  const adapter = instanceManager.getAdapter(instanceId) as ChannelAdapter;
 
   for (let i = 0; i < 60; i++) {
     myJid = getOwnJid(adapter);
@@ -934,32 +1052,35 @@ async function main() {
       const text = msg.message.content;
       if (!text) return;
 
-      if (agentSentMessages.delete(msg.message.id)) return;
-
-      const dedupKey = `${msg.chatId}:${msg.message.id}:${msg.message.timestamp}`;
-      if (processedMessages.has(dedupKey)) return;
-      processedMessages.add(dedupKey);
-      if (processedMessages.size > 1000) {
-        const toDelete = [...processedMessages].slice(0, 500);
-        for (const k of toDelete) processedMessages.delete(k);
-      }
-
-      const isOwnerSelfChat = Boolean(msg.message.isFromMe && myUserJid && msg.chatId === myUserJid);
-      if (!messageCanReachAgent(config, msg, isOwnerSelfChat, text)) {
-        logger.info("Message filtered out");
+      // Skip messages sent by the agent (detected by prefix)
+      if (isAgentMessage(text)) {
+        logger.debug({ messageId: msg.message.id }, "Skipping agent-sent message (prefix detected)");
         return;
       }
 
-      await waitForTypingToStop(msg.chatId);
+      // Dedup
+      const dedupKey = `${msg.chatId}:${msg.message.id}:${msg.message.timestamp}`;
+      if (processedMessages.has(dedupKey)) return;
+      processedMessages.add(dedupKey);
 
-      const senderName = await getContactName(adapter, msg.message.sender);
-      const chatName =
-        msg.chatId.endsWith("@g.us")
-          ? await getGroupName(adapter, msg.chatId)
-          : senderName;
+      const isOwnerSelfChat = Boolean(msg.message.isFromMe && myUserJid && msg.chatId === myUserJid);
+      if (!messageCanReachAgent(config, msg, isOwnerSelfChat, text)) {
+        logger.debug({ chatId: msg.chatId }, "Message filtered by policy");
+        return;
+      }
 
-      processMessage(adapter, config, instanceId, msg, text, isOwnerSelfChat, senderName, chatName, tools)
-        .catch((err) => logger.error(`processMessage error: ${err instanceof Error ? err.message : err}`));
+      // Process with per-chat lock to prevent concurrent handling
+      withChatLock(msg.chatId, async () => {
+        await waitForTypingToStop(msg.chatId);
+
+        const senderName = await getContactName(adapter, msg.message.sender);
+        const chatName =
+          msg.chatId.endsWith("@g.us")
+            ? await getGroupName(adapter, msg.chatId)
+            : senderName;
+
+        await processMessage(adapter, config, instanceId, msg, text, isOwnerSelfChat, senderName, chatName, tools, myJid);
+      }).catch((err) => logger.error({ chatId: msg.chatId, error: err instanceof Error ? err.message : err }, "processMessage error"));
     }
   });
 }

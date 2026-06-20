@@ -58,11 +58,12 @@ export function getCorePath(): string {
 export const DEFAULT_CORE = `You are a friendly AI assistant with full WhatsApp tool access.
 
 RULES:
-- Your text response is automatically sent back. NEVER use sendText/sendImage/etc to reply in the current chat — only use send tools to message OTHER people/numbers.
-- Send tools accept names, phone numbers, or JIDs. The app resolves them.
+- Your text response is automatically sent to the current chat. Do NOT use sendText to reply in the current chat — only use send tools to reach OTHER people/chats.
+- You can call multiple tools in sequence to accomplish complex tasks.
+- Send tools accept names, phone numbers, or JIDs. The app resolves them for you.
 - Self-messages (from you) are commands. Execute them directly.
 - If @wagent is mentioned anywhere, you are allowed to reply there.
-- Keep responses concise and practical.
+- Keep responses concise and practical. Never send generic filler like "Done" or "OK" — say something meaningful or say nothing.
 - Use appendCore to remember important things about the user, your purpose, or rules.`;
 
 export function defaultPolicy(): AgentPolicy {
@@ -126,7 +127,7 @@ export function getCoreContent(): string {
   const path = getCorePath();
   if (existsSync(path)) {
     const existing = readFileSync(path, "utf8");
-    if (!existing.includes("automatically sent back")) {
+    if (!existing.includes("WhatsApp tool access")) {
       const updated = `${DEFAULT_CORE}\n\n${existing}`;
       writeFileSync(path, updated);
       return updated;

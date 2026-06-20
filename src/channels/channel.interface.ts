@@ -38,6 +38,7 @@ export interface ChannelAdapter {
   connect(): Promise<void>;
   disconnect(): Promise<void>;
   getStatus(): ConnectionStatus;
+  getMyJid(): string | null;
 
   // ---- Authentication ----
   getQrCode(): Promise<string | null>;

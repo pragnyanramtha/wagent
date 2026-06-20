@@ -45,7 +45,7 @@ import { useSqliteAuthState, clearAuthState } from "./baileys.auth.js";
 import { getWaVersion } from "./baileys.version.js";
 import { db } from "../../db/client.js";
 import { contacts as contactsTable, messages as messagesTable } from "../../db/schema.js";
-import { eq, and, like, or, desc } from "drizzle-orm";
+import { eq, and, like, or, desc, max } from "drizzle-orm";
 import {
   normalizeMessagesUpsert,
   normalizeMessagesUpdate,
@@ -352,10 +352,23 @@ export class BaileysAdapter implements ChannelAdapter {
     const toJid = this.normalizeJid(to);
     const fromJid = this.normalizeJid(fromChat);
 
-    // Use the store or load message; for now forward with minimal message stub
+    const [originalMsg] = await db
+      .select()
+      .from(messagesTable)
+      .where(and(eq(messagesTable.instanceId, this.instanceId), eq(messagesTable.id, msgId)))
+      .limit(1);
+
+    if (!originalMsg) {
+      throw new Error(`Message ${msgId} not found in DB — cannot forward`);
+    }
+    const conversationText =
+      originalMsg.type === "text"
+        ? originalMsg.content ?? "(empty)"
+        : `[Forwarded ${originalMsg.type}]`;
+
     const stubMsg: WAMessage = {
       key: { remoteJid: fromJid, id: msgId, fromMe: false },
-      message: { conversation: "" },
+      message: { conversation: conversationText },
     } as WAMessage;
 
     const forwardContent = generateForwardMessageContent(stubMsg, false);
@@ -812,7 +825,27 @@ export class BaileysAdapter implements ChannelAdapter {
   }
 
   async getChats(): Promise<Chat[]> {
-    return [];
+    const rows = db
+      .select({
+        chatId: messagesTable.chatId,
+        lastMessageAt: max(messagesTable.timestamp),
+      })
+      .from(messagesTable)
+      .where(eq(messagesTable.instanceId, this.instanceId))
+      .groupBy(messagesTable.chatId)
+      .orderBy(desc(max(messagesTable.timestamp)))
+      .all();
+
+    return rows.map((r) => ({
+      jid: r.chatId,
+      name: null,
+      isGroup: r.chatId.endsWith("@g.us"),
+      unreadCount: 0,
+      isPinned: false,
+      isMuted: false,
+      isArchived: false,
+      lastMessageAt: r.lastMessageAt ?? null,
+    }));
   }
 
   async getMessages(chatId: string, limit = 50): Promise<Message[]> {
